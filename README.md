@@ -11,11 +11,9 @@
 Tiny, native sticky notes for macOS and Windows. Notes are native windows drawn in Rust, with
 no web view, so the app starts instantly, idles at 0% CPU and uses a few megabytes of memory.
 
-<p align="center">
-  <a href="promo/stick-itt-promo.mp4">
-    <img src="docs/images/demo-poster.png" alt="Watch the 95-second demo: writing in Markdown, tables, reminders, the dock, themes, desktops, shortcuts and settings" width="720">
-  </a>
-</p>
+https://github.com/user-attachments/assets/bf5d8cbe-f5dd-40eb-b00d-9b7fa28c3267
+
+<p align="center"><sub>The 95-second demo: writing in Markdown, tables, reminders, the dock, themes, desktops, shortcuts and settings. <a href="promo/stick-itt-promo.mp4">1080p version</a>.</sub></p>
 
 ## Features
 
