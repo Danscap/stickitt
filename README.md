@@ -12,15 +12,9 @@ Tiny, native sticky notes for macOS and Windows. Notes are native windows drawn 
 no web view, so the app starts instantly, idles at 0% CPU and uses a few megabytes of memory.
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/note-dark.png">
-    <img src="docs/images/note-light.png" alt="A note with a checklist, a reminder and its controls" width="340">
-  </picture>
-  &nbsp;&nbsp;
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/dock-dark.png">
-    <img src="docs/images/dock-light.png" alt="The edge dock listing notes in two lists" width="290">
-  </picture>
+  <a href="promo/stick-itt-promo.mp4">
+    <img src="docs/images/demo-poster.png" alt="Watch the 95-second demo: writing in Markdown, tables, reminders, the dock, themes, desktops, shortcuts and settings" width="720">
+  </a>
 </p>
 
 ## Features
