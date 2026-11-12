@@ -40,10 +40,10 @@ https://github.com/user-attachments/assets/bf5d8cbe-f5dd-40eb-b00d-9b7fa28c3267
 brew install --cask shiv122/tap/stick-itt
 ```
 
-Or download `Stick-itt-<version>-macos.dmg` from
-[Releases](https://github.com/shiv122/stickitt/releases) and drag Stick-itt to Applications.
+Or download `Stick-itt-<version>-macos.dmg` from the
+[latest release](https://github.com/shiv122/stickitt/releases/latest) and drag Stick-itt to Applications.
 
-**Windows** (10 or 11, x64): from [Releases](https://github.com/shiv122/stickitt/releases),
+**Windows** (10 or 11, x64): from the [latest release](https://github.com/shiv122/stickitt/releases/latest),
 download either
 
 - `Stick-itt-<version>-windows-setup.exe`: installs for your user (no admin prompt), with a
