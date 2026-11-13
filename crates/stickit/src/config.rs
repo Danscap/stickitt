@@ -369,6 +369,7 @@ macro_rules! actions {
 
 actions!(GlobalAction {
     NewNote = "new_note", "CmdOrCtrl+Alt+N", "Create a note from anywhere";
+    ReopenLastClosed = "reopen_last_closed", "CmdOrCtrl+Alt+Shift+N", "Reopen the last closed note in the current profile";
     PasteAsNote = "paste_as_note", "CmdOrCtrl+Alt+V", "Turn the clipboard into a new note";
     ToggleNotes = "toggle_notes", "CmdOrCtrl+Alt+H", "Hide or show every note";
     OpenDock = "open_dock", "CmdOrCtrl+Alt+D", "Slide the dock out (or tuck it away)";
@@ -1034,7 +1035,11 @@ impl Config {
              # \"Settings...\" (and otherwise the next time the dock opens).\n\n"
         );
         let line = |key: &str, value: &str, doc: &str| {
-            if doc.is_empty() {
+            if value.is_empty() && !doc.is_empty() {
+                // A comment after an empty value would be parsed as the value itself
+                // (leading '#' is also valid for colour settings). Keep disabled chords empty.
+                format!("# {doc}\n{key:<26}=\n")
+            } else if doc.is_empty() {
                 format!("{key:<26}= {value}\n")
             } else {
                 format!("{key:<26}= {value:<10} # {doc}\n")
@@ -1099,6 +1104,29 @@ fn parse_hex(value: &str) -> Option<Rgb> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reopen_shortcut_defaults_upgrade_remap_and_disable() {
+        let defaults = Config::defaults();
+        let action = GlobalAction::ReopenLastClosed;
+        let binding = action.default_binding();
+        assert_eq!(binding, "CmdOrCtrl+Alt+Shift+N");
+        let hotkey = binding.parse::<global_hotkey::hotkey::HotKey>().unwrap();
+        for (other, shortcut) in &defaults.global {
+            if *other != action {
+                assert_ne!(hotkey.id(), shortcut.parse::<global_hotkey::hotkey::HotKey>().unwrap().id());
+            }
+        }
+        let old =
+            defaults.render().lines().filter(|l| !l.starts_with("reopen_last_closed")).collect::<Vec<_>>().join("\n");
+        assert!(lacks_settings(&old));
+        assert!(Config::parse(&old).global.iter().any(|(a, b)| *a == action && b == binding));
+        for binding in ["Ctrl+Alt+Shift+R", ""] {
+            let cfg = Config::parse(&format!("[shortcuts.global]\nreopen_last_closed = {binding}\n"));
+            let again = Config::parse(&cfg.render());
+            assert!(again.global.iter().any(|(a, b)| *a == action && b == binding));
+        }
+    }
 
     #[test]
     fn new_note_mode_setting_defaults_and_roundtrips() {

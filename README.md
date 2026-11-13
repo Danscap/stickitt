@@ -231,6 +231,20 @@ The tray icon (menu bar on macOS) has a new note, paste as note, the dock, hide 
 note (<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>H</kbd>), a list of hidden notes, settings and quit. Closing the windows from the taskbar
 sends Stick-itt to the tray rather than quitting.
 
+### Reopen the last closed note
+
+Press **Ctrl+Alt+Shift+N** (Cmd+Alt+Shift+N on macOS), or choose **Reopen last closed
+note** in the tray menu. It reopens and focuses the most recently deliberately closed
+note available in the current profile, without opening the dock. Repeated presses
+work backward through closed notes. Like choosing a note in the dock, it brings the
+note to the current desktop; it does not switch profiles or create a note when none
+is eligible. This is separate from Trash Undo: deleted notes are excluded.
+
+The close order survives normal restarts in the existing settings table. Notes hidden
+by profile/date filters or Hide All are not added; pre-existing hidden notes have no
+inferred close order. Reopened notes are skipped. Configure or disable the shortcut
+with `reopen_last_closed` in `[shortcuts.global]`.
+
 ### Dates, previews and selection
 
 The dock's **All / Today / Yesterday / Calendar** controls use local creation dates.
@@ -427,7 +441,7 @@ Modifiers: `Ctrl`, `Shift`, `Alt`, `Cmd`/`Super`, `CmdOrCtrl`. Keys: `A`–`Z`, 
 `F1`–`F24`, `Enter`, `Tab`, `Space`, `Escape`, `Backspace`, `Delete`, arrows (`ArrowUp`…),
 `Equal`, `Minus`, `Comma`, `Period`, `Slash`, `Backquote`, `BracketLeft`/`BracketRight`.
 
-Global: `new_note`, `paste_as_note`, `toggle_notes`, `open_dock`, `next_profile`,
+Global: `new_note`, `reopen_last_closed`, `paste_as_note`, `toggle_notes`, `open_dock`, `next_profile`,
 `open_settings`.
 
 In a note: `new_note`, `close_note`, `delete_note`, `quit`, `cycle_mode`, `pick_color`,

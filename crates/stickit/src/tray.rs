@@ -12,6 +12,7 @@ const NOTE_PREFIX: &str = "note:";
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TrayCmd {
     NewNote,
+    ReopenLastClosed,
     PasteAsNote,
     OpenDock,
     ToggleNotes,
@@ -33,6 +34,7 @@ pub struct Tray {
 /// Shortcut hints shown beside menu items (they are not registered here).
 pub struct Hints<'a> {
     pub new_note: &'a str,
+    pub reopen_last_closed: &'a str,
     pub paste_as_note: &'a str,
     pub open_dock: &'a str,
     pub toggle_notes: &'a str,
@@ -50,8 +52,9 @@ impl Tray {
         let toggle = item("toggle", "Hide all notes", hints.toggle_notes);
         let hidden = Submenu::new("Hidden notes", false);
         let menu = Menu::new();
-        let items: [&dyn IsMenuItem; 10] = [
+        let items: [&dyn IsMenuItem; 11] = [
             &item("new", "New note", hints.new_note),
+            &item("reopen", "Reopen last closed note", hints.reopen_last_closed),
             &item("paste", "Paste as note", hints.paste_as_note),
             &PredefinedMenuItem::separator(),
             &item("dock", "Open dock", hints.open_dock),
@@ -107,6 +110,7 @@ impl Tray {
     pub fn command(id: &str) -> Option<TrayCmd> {
         Some(match id {
             "new" => TrayCmd::NewNote,
+            "reopen" => TrayCmd::ReopenLastClosed,
             "paste" => TrayCmd::PasteAsNote,
             "dock" => TrayCmd::OpenDock,
             "toggle" => TrayCmd::ToggleNotes,
@@ -124,6 +128,7 @@ mod tests {
 
     #[test]
     fn menu_ids_map_to_commands() {
+        assert_eq!(Tray::command("reopen"), Some(TrayCmd::ReopenLastClosed));
         assert_eq!(Tray::command("quit"), Some(TrayCmd::Quit));
         assert_eq!(Tray::command("note:42"), Some(TrayCmd::Reveal(42)));
         assert_eq!(Tray::command("note:x"), None);

@@ -266,6 +266,7 @@ impl Store {
 
     /// Takes a note out of the trash and returns it.
     pub fn restore(&self, id: i64) -> rusqlite::Result<Option<NoteRecord>> {
+        self.forget_closed(id);
         self.conn.execute("UPDATE notes SET deleted_at=NULL WHERE id=?1", [id])?;
         Ok(self.notes_where("id=?1", [id])?.pop())
     }
@@ -392,6 +393,51 @@ impl Store {
 
     // ---- settings ---------------------------------------------------------------------------
 
+    /// Only explicit single-note closes enter this MRU. Stored in the existing settings
+    /// table, so old databases and binaries need no additional schema migration.
+    pub fn remember_closed(&self, id: i64) {
+        let mut ids = self.closed_notes();
+        ids.retain(|old| *old != id);
+        ids.insert(0, id);
+        self.write_closed_notes(&ids);
+    }
+
+    pub fn forget_closed(&self, id: i64) {
+        let mut ids = self.closed_notes();
+        let len = ids.len();
+        ids.retain(|old| *old != id);
+        if ids.len() != len {
+            self.write_closed_notes(&ids);
+        }
+    }
+
+    fn closed_notes(&self) -> Vec<i64> {
+        self.setting("closed_notes")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| s.parse::<i64>().ok())
+            .filter(|id| *id > 0)
+            .collect()
+    }
+
+    fn write_closed_notes(&self, ids: &[i64]) {
+        self.set_setting("closed_notes", &ids.iter().map(i64::to_string).collect::<Vec<_>>().join(","));
+    }
+
+    /// `available` comes from live windows in the current profile, excluding closing
+    /// windows. Database checks also reject Trash, purged and already reopened notes.
+    pub fn last_closed(&self, available: &[i64]) -> Option<i64> {
+        self.closed_notes().into_iter().find(|id| {
+            available.contains(id)
+                && self
+                    .conn
+                    .query_row("SELECT hidden != 0 AND deleted_at IS NULL FROM notes WHERE id=?1", [id], |r| {
+                        r.get::<_, bool>(0)
+                    })
+                    .unwrap_or(false)
+        })
+    }
+
     pub fn setting(&self, key: &str) -> Option<String> {
         self.conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |r| r.get(0)).optional().ok().flatten()
     }
@@ -412,6 +458,105 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn close_fixture(store: &mut Store, id: i64) {
+        let mut rec = store.load().unwrap().into_iter().find(|r| r.id == id).unwrap();
+        rec.hidden = true;
+        store.save_all([&rec]).unwrap();
+        store.remember_closed(id);
+    }
+
+    #[test]
+    fn closed_order_is_explicit_latest_first_and_deduplicated() {
+        let mut store = Store::in_memory().unwrap();
+        let a = store.insert(&note()).unwrap();
+        let b = store.insert(&note()).unwrap();
+        assert_eq!(store.last_closed(&[a, b]), None);
+        // Merely being hidden (e.g. old data) does not invent a deliberate close.
+        store.conn.execute("UPDATE notes SET hidden=1", []).unwrap();
+        assert_eq!(store.last_closed(&[a, b]), None);
+        close_fixture(&mut store, a);
+        close_fixture(&mut store, b);
+        assert_eq!(store.last_closed(&[a, b]), Some(b));
+        close_fixture(&mut store, a);
+        assert_eq!(store.closed_notes(), vec![a, b]);
+        assert_eq!(store.last_closed(&[a, b]), Some(a));
+        store.forget_closed(a);
+        assert_eq!(store.last_closed(&[a, b]), Some(b));
+    }
+
+    #[test]
+    fn closed_selection_excludes_reopened_deleted_restored_and_unavailable_notes() {
+        let mut store = Store::in_memory().unwrap();
+        let a = store.insert(&note()).unwrap();
+        let b = store.insert(&note()).unwrap();
+        close_fixture(&mut store, a);
+        close_fixture(&mut store, b);
+        assert_eq!(store.last_closed(&[]), None);
+        assert_eq!(store.last_closed(&[a]), Some(a)); // b has no available window
+        let mut rec = store.load().unwrap().into_iter().find(|n| n.id == b).unwrap();
+        rec.hidden = false;
+        store.save_all([&rec]).unwrap();
+        assert_eq!(store.last_closed(&[a, b]), Some(a));
+        close_fixture(&mut store, b);
+        store.trash_many(&[b]).unwrap();
+        assert_eq!(store.last_closed(&[a, b]), Some(a));
+        store.restore(b).unwrap();
+        assert_eq!(store.last_closed(&[a, b]), Some(a), "Trash undo must not restore close history");
+        store.trash(a).unwrap();
+        store.purge(a).unwrap();
+        assert_eq!(store.last_closed(&[a, b]), None);
+        store.set_setting("closed_notes", "invalid,-1,999999");
+        assert_eq!(store.last_closed(&[a, b, 999999]), None);
+    }
+
+    #[test]
+    fn closed_selection_preserves_other_profile_history() {
+        let mut store = Store::in_memory().unwrap();
+        let a = store.insert(&note()).unwrap();
+        let profile = store.create_profile("Other fixture profile", &[]).unwrap();
+        let other_list = store.create_list("Other fixture list", profile).unwrap();
+        let mut rec = note();
+        rec.list = other_list;
+        let b = store.insert(&rec).unwrap();
+        close_fixture(&mut store, a);
+        close_fixture(&mut store, b);
+        let available =
+            |list| store.load().unwrap().into_iter().filter(|r| r.list == list).map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(store.last_closed(&available(DEFAULT_LIST)), Some(a));
+        assert_eq!(store.last_closed(&available(other_list)), Some(b));
+        store.forget_closed(a);
+        assert_eq!(store.last_closed(&available(DEFAULT_LIST)), None);
+        assert_eq!(store.last_closed(&available(other_list)), Some(b));
+    }
+
+    #[test]
+    fn closed_order_survives_restart_without_schema_change() {
+        let path = std::env::temp_dir().join(format!(
+            "stickit-closed-{}-{}.db",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        let (a, b);
+        {
+            let mut store = Store::open(&path).unwrap();
+            a = store.insert(&note()).unwrap();
+            b = store.insert(&note()).unwrap();
+            close_fixture(&mut store, a);
+            close_fixture(&mut store, b);
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.last_closed(&[a, b]), Some(b));
+            assert_eq!(store.conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0)).unwrap(), 6);
+            store.forget_closed(b);
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.last_closed(&[a, b]), Some(a));
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn failed_bulk_trash_rolls_back_every_note() {

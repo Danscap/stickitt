@@ -7,6 +7,15 @@ has occurred.
 
 ## Implemented
 
+- **Reopen last closed note**: configurable global `CmdOrCtrl+Alt+Shift+N` and
+  matching tray command. It reuses the existing bring-forward path without opening
+  the dock, preserves the active profile, and skips deleted/reopened/unavailable
+  notes. Explicit single-note close order persists in `settings.closed_notes`;
+  automatic visibility changes and taskbar Close All do not enter that history.
+  No extra schema migration or changes to existing note data are needed. No eligible
+  note means no action. Test with fixture notes in distinct profile lists: close A
+  then B, reopen twice, restart, delete/restore, Hide All, and switch profiles.
+
 - **New notes always on top**: a checkbox in the dock's right-click menu and
   `[notes] always_on_top = false` in `stickit.ini`. Applies only to newly created
   notes. Existing modes and per-note mode controls stay independent. Save failures
@@ -123,6 +132,10 @@ See `validation/` in the delivery bundle for exact logs.
 - Untouched pinned baseline: **76 tests passed** (fresh baseline compilation).
 - Initial implementation: **83 tests passed**.
 - Preview correction: **90 tests passed**, including 7 input-routing regressions.
+- Reopen command: **95 tests passed**, including close order, restart, exclusions,
+  profile availability, default shortcut uniqueness, remapping and disabling. Linux
+  build/strict Clippy and Windows GNU all-target strict Clippy passed for this change.
+  Native shortcut registration, focus and desktop movement remain runtime checks.
 - Linux `cargo build --locked`: passed.
 - Linux `cargo clippy --all-targets --locked -- -D warnings`: passed.
 - Windows GNU cross-target `cargo clippy --all-targets --locked --target

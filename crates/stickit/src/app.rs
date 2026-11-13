@@ -459,17 +459,26 @@ impl App {
                 for (_, id) in &self.system_closes {
                     if let Some(n) = self.notes.get_mut(id) {
                         n.unhide();
+                        self.store.forget_closed(n.id);
                     }
                 }
                 self.hidden = true;
                 self.apply_visibility();
             }
             Cmd::Close => {
-                if let Some(n) = self.notes.get_mut(&from) {
+                let mut closed = None;
+                if let Some(n) = self.notes.get_mut(&from).filter(|n| !n.closing) {
                     if let Some(d) = self.desktops.of(&n.window) {
                         n.desktop = Some(d);
                     }
                     n.hide();
+                    closed = Some(n.id);
+                }
+                if let Some(id) = closed {
+                    // Persist hidden state/body before the close order so normal restarts
+                    // can reopen it without guessing from modification timestamps.
+                    self.flush();
+                    self.store.remember_closed(id);
                 }
                 self.dock_stale = true;
                 self.tray_stale = true;
@@ -607,6 +616,9 @@ impl App {
                         }
                     }
                     n.reveal(true);
+                    self.store.forget_closed(n.id);
+                    self.dock_stale = true;
+                    self.tray_stale = true;
                 }
             }
             DockCmd::NewNote => {
@@ -856,6 +868,7 @@ impl App {
             |a: GlobalAction| self.shared.config.global.iter().find(|(g, _)| *g == a).map_or("", |(_, b)| b.as_str());
         let hints = Hints {
             new_note: hint(GlobalAction::NewNote),
+            reopen_last_closed: hint(GlobalAction::ReopenLastClosed),
             paste_as_note: hint(GlobalAction::PasteAsNote),
             open_dock: hint(GlobalAction::OpenDock),
             toggle_notes: hint(GlobalAction::ToggleNotes),
@@ -886,6 +899,7 @@ impl App {
     fn run_tray(&mut self, el: &ActiveEventLoop, cmd: TrayCmd) {
         match cmd {
             TrayCmd::NewNote => self.run_global(el, GlobalAction::NewNote),
+            TrayCmd::ReopenLastClosed => self.run_global(el, GlobalAction::ReopenLastClosed),
             TrayCmd::PasteAsNote => self.run_global(el, GlobalAction::PasteAsNote),
             TrayCmd::ToggleNotes => self.run_global(el, GlobalAction::ToggleNotes),
             TrayCmd::Settings => self.open_settings(),
@@ -960,6 +974,22 @@ impl App {
             GlobalAction::NewNote => {
                 let color = self.next_color();
                 self.create(el, "", color, None, true);
+            }
+            GlobalAction::ReopenLastClosed => {
+                self.finish_date_preview(false);
+                self.flush();
+                let lists = self.active_lists();
+                let available: Vec<_> = self
+                    .notes
+                    .values()
+                    .filter(|n| !n.closing && n.user_hidden && lists.contains(&n.list))
+                    .map(|n| n.id)
+                    .collect();
+                if let Some(id) = self.store.last_closed(&available) {
+                    // Shares the existing tray/dock bring-forward path, without opening
+                    // the dock, selecting another profile, or creating an empty note.
+                    self.run_tray(el, TrayCmd::Reveal(id));
+                }
             }
             GlobalAction::PasteAsNote => {
                 let text = self.shared.clipboard.as_mut().and_then(|c| c.get_text().ok()).unwrap_or_default();
@@ -1156,6 +1186,7 @@ impl ApplicationHandler<UserEvent> for App {
         let mut dirty = false;
         for note in self.notes.values_mut() {
             if self.date_preview.is_none() && note.due(ts) {
+                self.store.forget_closed(note.id);
                 note.ring(self.shared.config.reminders.sound);
             }
             if let Some(t) = note.tick(now) {
