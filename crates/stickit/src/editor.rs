@@ -212,7 +212,7 @@ impl Doc {
 
     /// Insert a child task using the same two-space indentation as Tab. A selection,
     /// marker-prefix caret or fenced code is not an active checklist editing context.
-    pub fn subtask(&mut self) -> bool {
+    pub fn can_subtask(&self) -> bool {
         let (ls, le) = self.line_bounds(self.cursor);
         let line = &self.text[ls..le];
         let info = line_info(line);
@@ -224,6 +224,16 @@ impl Doc {
         {
             return false;
         }
+        self.preedit.is_none()
+    }
+
+    pub fn subtask(&mut self) -> bool {
+        if !self.can_subtask() {
+            return false;
+        }
+        let (ls, le) = self.line_bounds(self.cursor);
+        let line = &self.text[ls..le];
+        let info = line_info(line);
         let marker = &line[info.indent..info.marker_end];
         let child_marker = if info.ordered.is_some() { "1. " } else { marker };
         self.insert_other(&format!("\n{}  {child_marker}[ ] ", &line[..info.indent]));

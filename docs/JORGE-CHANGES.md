@@ -1,10 +1,12 @@
-# Jorge's Stickitt changes — local review build
+# Jorge's Stickitt changes — draft code review
 
 Target fork: https://github.com/Danscap/stickitt
 
 Pinned base: `00a26002fc7505ecf73f2d75ddbba375b1d5ce0a`.
-The fork's `main` was checked against this base before editing. Changes are local only:
-no push, PR, workflow dispatch, release, or access to a live note database.
+The fork's `main` was checked against this base before editing. Changes are on the
+fork-only branch `jorge/review-note-enhancements-20261113` in draft PR
+https://github.com/Danscap/stickitt/pull/1. No installer dispatch, merge, tag, release,
+or access to a live note database has occurred.
 
 ## Implemented
 
@@ -24,10 +26,20 @@ no push, PR, workflow dispatch, release, or access to a live note database.
 - **Desktop preview**: date selection previews actual note windows in the current
   profile and desktop. Repeated choices retain the initial rollback snapshot.
   Accept keeps the selected windows; Never Mind/Escape restores visibility and
-  minimization. Wheel and Up/Down/Page keys scroll without accepting. Typing,
-  clicking, or closing a note accepts before the action runs. Synthetic key events
-  and empty IME events do not accept. Scope-changing app actions and due reminders
-  cancel previews first. Preview never changes the persisted hidden flags.
+  minimization. Wheel and Up/Down/Page keys scroll without accepting. Focus,
+  caret placement, word/line/drag selection, Left/Right/Home/End, Select All, Copy,
+  and table cell navigation stay in preview. Keyboard editing (including paste,
+  cut, undo/redo, formatting and checklist commands), nonempty IME composition or
+  commit, checkbox toggles, table + buttons and creating a paragraph below a table
+  accept before the original edit is dispatched exactly once. Pointer edits retain
+  the captured hit-tested target. Read-only clicks place the caret for subsequent
+  typing; IME preedit is not inserted as committed text.
+  Close requests, note chrome/resize/drag controls, links, property shortcuts and
+  compact-note activation are inert until explicit Accept. Escape always cancels.
+  Synthetic keys, modifier keys and empty/cancelled IME events do not accept.
+  Existing popovers/drag state are cleared on each date choice so they cannot consume
+  the first edit. Scope-changing app actions and due reminders cancel previews first.
+  Preview never changes persisted hidden flags until acceptance.
 - **Selection and Trash**: Select All covers currently displayed note cards under
   the active date/search/profile filters and expanded groups. “Move all except
   today to Trash” ignores dock date/search filters, includes hidden notes and other
@@ -103,15 +115,17 @@ release and its SHA-256 matched the published digest. Debian Wine 10 aborted wit
 `free(): invalid pointer` before the compiler setup could run, both with workspace
 and host runtime libraries. No installer compiler execution/build succeeded.
 A supported Windows builder is still needed. The fork's existing GitHub workflow
-could provide one only after separately authorized source publication/dispatch;
-neither was performed.
+is available for a later authorized installer step. Source is now in draft PR
+https://github.com/Danscap/stickitt/pull/1 for review. No installer workflow has been
+dispatched; merge, tags, releases and installer work remain paused.
 
 ## Validation evidence
 
 See `validation/` in the delivery bundle for exact logs.
 
 - Untouched pinned baseline: **76 tests passed** (fresh baseline compilation).
-- Updated source: **83 tests passed**.
+- Initial implementation: **83 tests passed**.
+- Preview correction: **90 tests passed**, including 7 input-routing regressions.
 - Linux `cargo build --locked`: passed.
 - Linux `cargo clippy --all-targets --locked -- -D warnings`: passed.
 - Windows GNU cross-target `cargo clippy --all-targets --locked --target
@@ -159,8 +173,15 @@ for QA. Close one run before starting the next.
    Unicode, undo/redo, checkbox click, ordinary text, selected text, IME and AltGr.
 3. Preview yesterday, today, another day, and an empty day. Never Mind/Escape must
    restore the original visible/hidden/minimized set after repeated choices.
-4. Scroll by mouse and keyboard; then click/type in a preview. Acceptance must
-   happen before the first intended edit, with the click at the correct position.
+4. Focus, scroll, click to place the caret, double/triple-click/select/Copy, use
+   navigation keys, click note chrome or request close, then Never Mind. The original
+   windows must return. Repeat preview, click inside Unicode text, then type: only
+   typing accepts, and the first character replaces/inserts at that exact target once.
+   Check checkbox toggles, table + buttons, table cell Tab/Enter vs row extension,
+   keyboard formatting and Ctrl+Enter with one Undo. Start IME composition: it accepts
+   before display composition; commit appears once. Empty composition does not accept.
+   Compact notes require explicit Accept before activation. Check AltGr and remapped
+   note shortcuts; non-edit shortcuts must not accept.
 5. Accept yesterday. Reopen Calendar and cancel a different date. Verify the
    accepted view returns. Check reminders, profile changes and dock focus.
 6. Test Tab/Shift+Tab/Enter, month boundaries, both themes, compact/detailed/icon

@@ -243,8 +243,12 @@ across timezone changes. Trashed notes retain their date when restored.
 Choose a day to preview its actual windows within the current profile and desktop.
 Choosing another day replaces the preview while keeping the original rollback snapshot.
 **Accept** keeps the chosen windows open; **Never Mind** or Escape restores prior visibility.
-An empty day previews no windows. Preview permits scrolling; typing or clicking a note
-accepts it before that action runs. Other profiles/desktops are not moved or changed.
+An empty day previews no windows. Scrolling, focus, caret placement, text selection and
+copying stay in preview. Typing/IME composition, editing shortcuts, checkbox toggles
+and table additions accept before the first edit runs once at its original target.
+Note close/chrome controls and non-edit shortcuts are inert during preview; use
+Accept before those actions (also before opening a compact note). Other profiles/desktops
+are not moved or changed.
 A due reminder cancels a preview before ringing. Date filtering is session-only. In icon view, the dock's right-click menu opens date navigation.
 Tab / Shift+Tab move focus among controls, and Enter activates the focused control.
 

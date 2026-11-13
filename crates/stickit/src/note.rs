@@ -6,6 +6,7 @@ use crate::gfx::{self, Clip};
 use crate::markdown::{self, is_table_separator, line_info, table_cells, table_pipes, Flags};
 use crate::motion::{Feel, Motion};
 use crate::popover::{self, SlashKind, ICON_TABS, SLASH};
+use crate::preview_input::{self, TextPress};
 use crate::reminder::{self, Reminder, Repeat};
 use crate::store::{List, NoteRecord};
 use crate::surface::{self, Surface};
@@ -309,6 +310,12 @@ enum Zone {
     Button(Action),
     Bar,
     Text,
+}
+
+pub enum PreviewEdit {
+    Dispatch,
+    Text(TextPress),
+    Table(usize, bool),
 }
 
 pub struct Note {
@@ -3617,31 +3624,7 @@ impl Note {
         }
     }
 
-    fn on_pointer_move(&mut self, x: f64, y: f64, shared: &mut Shared) {
-        // A resize, selection or hue drag whose button is no longer held lost its release
-        // (macOS can send it to another window): end it rather than follow the pointer.
-        if !crate::input::left_button_down() {
-            if self.resizing.take().is_some() {
-                self.dirty = true;
-                self.needs_paint = true;
-            }
-            if self.moving.take().is_some() {
-                self.window.set_cursor(CursorIcon::Default);
-                crate::input::show_cursor(CursorIcon::Default);
-            }
-            self.drag_select = false;
-            self.hue_drag = false;
-        }
-        // macOS keeps sending moves to a focused window from anywhere on screen: outside the
-        // note, it is simply not hovered.
-        let busy = self.resizing.is_some() || self.moving.is_some() || self.drag_select || self.hue_drag;
-        if !busy && !crate::input::inside(x, y, self.window.inner_size()) {
-            if std::mem::take(&mut self.hovered) || self.hover.take().is_some() {
-                self.needs_paint = true;
-            }
-            return;
-        }
-        self.pointer = (x, y);
+    fn update_table_hover(&mut self, x: f64, y: f64) {
         // Near a table: show its + buttons.
         let m = 14.0 * self.scale();
         let (px, py) = (x as f32, y as f32);
@@ -3672,6 +3655,34 @@ impl Note {
             self.table_cell = cell;
             self.needs_paint = true;
         }
+    }
+
+    fn on_pointer_move(&mut self, x: f64, y: f64, shared: &mut Shared) {
+        // A resize, selection or hue drag whose button is no longer held lost its release
+        // (macOS can send it to another window): end it rather than follow the pointer.
+        if !crate::input::left_button_down() {
+            if self.resizing.take().is_some() {
+                self.dirty = true;
+                self.needs_paint = true;
+            }
+            if self.moving.take().is_some() {
+                self.window.set_cursor(CursorIcon::Default);
+                crate::input::show_cursor(CursorIcon::Default);
+            }
+            self.drag_select = false;
+            self.hue_drag = false;
+        }
+        // macOS keeps sending moves to a focused window from anywhere on screen: outside the
+        // note, it is simply not hovered.
+        let busy = self.resizing.is_some() || self.moving.is_some() || self.drag_select || self.hue_drag;
+        if !busy && !crate::input::inside(x, y, self.window.inner_size()) {
+            if std::mem::take(&mut self.hovered) || self.hover.take().is_some() {
+                self.needs_paint = true;
+            }
+            return;
+        }
+        self.pointer = (x, y);
+        self.update_table_hover(x, y);
         if self.moving.is_some() {
             self.carry(x, y);
             return;
@@ -3758,17 +3769,8 @@ impl Note {
                 return None;
             }
         }
-        if let Some(&(r, first)) =
-            self.table_hover.and_then(|i| self.table_rects.get(i)).filter(|_| self.st.table_buttons)
-        {
-            let s = self.scale();
-            let near = |cx: f32, cy: f32| (x as f32 - cx).hypot(y as f32 - cy) <= 11.0 * s;
-            if near(r.0 + r.2 / 2.0, r.1 + r.3) {
-                return self.table_add(first, false, shared);
-            }
-            if near(r.0 + r.2, r.1 + r.3 / 2.0) {
-                return self.table_add(first, true, shared);
-            }
+        if let Some((first, column)) = self.table_add_hit() {
+            return self.table_add(first, column, shared);
         }
         match zone {
             Zone::Outside => return self.screen_point().map(|(x, y)| Cmd::PassClick(x, y)),
@@ -3797,59 +3799,87 @@ impl Note {
                 crate::input::show_cursor(CursorIcon::Move);
             }
             Zone::Text => {
-                let now = Instant::now();
-                let count = match self.last_click {
-                    Some((t, p, n))
-                        if now - t < Duration::from_millis(450) && (p.0 - x).abs() < 4.0 && (p.1 - y).abs() < 4.0 =>
-                    {
-                        n % 3 + 1
-                    }
-                    _ => 1,
-                };
-                self.last_click = Some((now, (x, y), count));
-                let off = self.hit_window(x, y);
-                let open = if cfg!(target_os = "macos") { self.mods.super_key() } else { self.mods.control_key() };
-                if open && count == 1 {
-                    let (ls, le) = self.doc.line_bounds(off);
-                    if let Some(url) = markdown::link_at(&self.doc.text[ls..le], off - ls) {
-                        crate::input::open_url(url);
-                        return None;
-                    }
-                }
-                let shift = self.mods.shift_key();
-                if let (1, false, Some((ls, le))) = (count, shift, self.checkbox_at(off)) {
-                    self.doc.toggle_check_at_line(ls, le);
-                    self.pop_checkbox(ls);
-                    self.changed(shared, true);
-                    return None;
-                }
-                self.editing = true;
-                match count {
-                    2 => self.doc.select_word_at(off),
-                    3 => self.doc.select_line_at(off),
-                    _ => {
-                        // Below a table that ends the note: a new line there, to write on.
-                        let (_, cy, _, _) = self.content_rect();
-                        let below = y as f32 > cy + self.content_h - self.scroll;
-                        let end = self.doc.text.len();
-                        if below && !shift && crate::table::grid_at(&self.doc.text, end).is_some() {
-                            self.leave_table(end);
-                            self.changed(shared, true);
-                            return None;
-                        }
-                        // In a table, onto the cell on that side of the divider.
-                        let off = match crate::table::grid_at(&self.doc.text, off) {
-                            Some(g) if !shift => g.nearest(off),
-                            _ => off,
-                        };
-                        self.doc.move_to(off, shift);
-                        self.drag_select = true;
-                    }
-                }
-                self.changed(shared, false);
+                let press = self.text_press();
+                self.apply_text_press(press, shared);
             }
         }
         None
+    }
+
+    fn table_add_hit(&self) -> Option<(usize, bool)> {
+        let &(r, first) = self.table_hover.and_then(|i| self.table_rects.get(i)).filter(|_| self.st.table_buttons)?;
+        let (x, y) = self.pointer;
+        let near = |cx: f32, cy: f32| (x as f32 - cx).hypot(y as f32 - cy) <= 11.0 * self.scale();
+        if near(r.0 + r.2 / 2.0, r.1 + r.3) {
+            Some((first, false))
+        } else if near(r.0 + r.2, r.1 + r.3 / 2.0) {
+            Some((first, true))
+        } else {
+            None
+        }
+    }
+
+    fn text_press(&mut self) -> TextPress {
+        let (x, y) = self.pointer;
+        let now = Instant::now();
+        let count = match self.last_click {
+            Some((t, p, n))
+                if now - t < Duration::from_millis(450) && (p.0 - x).abs() < 4.0 && (p.1 - y).abs() < 4.0 =>
+            {
+                n % 3 + 1
+            }
+            _ => 1,
+        };
+        self.last_click = Some((now, (x, y), count));
+        let off = self.hit_window(x, y);
+        let open = if cfg!(target_os = "macos") { self.mods.super_key() } else { self.mods.control_key() };
+        if open && count == 1 {
+            let (ls, le) = self.doc.line_bounds(off);
+            if let Some(url) = markdown::link_at(&self.doc.text[ls..le], off - ls) {
+                return TextPress::Link(url.to_string());
+            }
+        }
+        let shift = self.mods.shift_key();
+        if let (1, false, Some((ls, le))) = (count, shift, self.checkbox_at(off)) {
+            return TextPress::Checkbox(ls, le);
+        }
+        match count {
+            2 => TextPress::Word(off),
+            3 => TextPress::Line(off),
+            _ => {
+                let (_, cy, _, _) = self.content_rect();
+                let end = self.doc.text.len();
+                if y as f32 > cy + self.content_h - self.scroll
+                    && !shift
+                    && crate::table::grid_at(&self.doc.text, end).is_some()
+                {
+                    return TextPress::LeaveTable(end);
+                }
+                let off = match crate::table::grid_at(&self.doc.text, off) {
+                    Some(g) if !shift => g.nearest(off),
+                    _ => off,
+                };
+                TextPress::Caret(off, shift)
+            }
+        }
+    }
+
+    fn apply_text_press(&mut self, press: TextPress, shared: &mut Shared) {
+        let edits = press.edits();
+        if let TextPress::Link(url) = &press {
+            crate::input::open_url(url);
+            return;
+        }
+        press.apply(&mut self.doc);
+        if let TextPress::Checkbox(ls, _) = press {
+            self.pop_checkbox(ls);
+        } else {
+            self.editing = true;
+        }
+        if matches!(press, TextPress::Caret(..)) {
+            self.drag_select = true;
+        }
+        self.changed(shared, edits);
     }
 
     // ---- dock support -------------------------------------------------------------------
@@ -3917,40 +3947,126 @@ impl Note {
         self.needs_paint = true;
     }
 
-    /// Preview is scroll-only until the app accepts it on edit intent.
-    pub fn preview_event(&mut self, event: &WindowEvent) {
+    /// Drop transient control state when entering preview. No document or persisted flags change.
+    pub fn begin_preview(&mut self) {
+        self.popover = None;
+        self.pop_rect = None;
+        self.pop_hits.clear();
+        self.drag_select = false;
+        self.hue_drag = false;
+        self.moving = None;
+        self.resizing = None;
+        self.last_click = None;
+    }
+
+    /// Read-only events run here. Return a captured edit to apply only AFTER App accepts.
+    pub fn preview_event(&mut self, event: &WindowEvent, shared: &mut Shared) -> Option<PreviewEdit> {
+        use preview_input::Route;
+        let action = match event {
+            WindowEvent::KeyboardInput { event, .. } => shared.config.note_action(event, self.mods),
+            _ => None,
+        };
+        let route = preview_input::event(&self.doc, event, self.mods, action);
+        if route == Route::Edit && !self.collapsed() {
+            return Some(PreviewEdit::Dispatch);
+        }
         match event {
-            WindowEvent::CursorMoved { position, .. } => self.pointer = (position.x, position.y),
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => self.layout_dirty = true,
+            WindowEvent::ThemeChanged(theme) => {
+                self.dark = crate::theme::is_dark(Some(*theme));
+                self.layout_dirty = true;
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.pointer = (position.x, position.y);
+                self.update_table_hover(position.x, position.y);
+                if !crate::input::left_button_down() {
+                    self.drag_select = false;
+                }
+                if self.drag_select {
+                    let off = self.hit_window(position.x, position.y);
+                    self.doc.move_to(off, true);
+                    self.changed(shared, false);
+                }
+            }
             WindowEvent::CursorEntered { .. } => self.hovered = true,
             WindowEvent::CursorLeft { .. } => self.hovered = false,
-            WindowEvent::Focused(focused) => self.focused = *focused,
+            WindowEvent::Focused(focused) => {
+                self.focused = *focused;
+                self.drag_select = false;
+            }
+            WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::KeyboardInput { event: ev, is_synthetic: false, .. }
+                if ev.state == ElementState::Pressed && !self.collapsed() =>
+            {
+                match route {
+                    Route::Edit => return Some(PreviewEdit::Dispatch),
+                    Route::Read => {
+                        self.on_key(ev, shared);
+                    }
+                    Route::Scroll => {
+                        self.scroll += match ev.logical_key {
+                            Key::Named(NamedKey::ArrowUp) => -self.st.line() * self.scale(),
+                            Key::Named(NamedKey::ArrowDown) => self.st.line() * self.scale(),
+                            Key::Named(NamedKey::PageUp) => -self.content_rect().3,
+                            _ => self.content_rect().3,
+                        };
+                    }
+                    Route::Ignore => {}
+                }
+            }
+            WindowEvent::Ime(Ime::Disabled | Ime::Preedit(_, _)) => {
+                // Empty/cancelled composition changes display state only.
+                self.doc.preedit = None;
+                self.layout_dirty = true;
+            }
+            WindowEvent::MouseInput { button: MouseButton::Left, state: ElementState::Pressed, .. }
+                if !self.collapsed() =>
+            {
+                self.sync_layout(&mut shared.fonts);
+                let (x, y) = self.pointer;
+                if let Some((first, column)) = self.table_add_hit() {
+                    return Some(PreviewEdit::Table(first, column));
+                }
+                if matches!(self.zone(x, y), Zone::Text) {
+                    let press = self.text_press();
+                    if press.edits() {
+                        return Some(PreviewEdit::Text(press));
+                    }
+                    if !matches!(press, TextPress::Link(_)) {
+                        self.apply_text_press(press, shared);
+                    }
+                }
+            }
+            WindowEvent::MouseInput { button: MouseButton::Left, state: ElementState::Released, .. } => {
+                self.drag_select = false;
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.scroll -= match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y * 3.0 * self.st.line() * self.scale(),
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                };
+            }
             _ => {}
         }
-        if let WindowEvent::ModifiersChanged(m) = event {
-            self.mods = m.state();
-        }
-        if let WindowEvent::KeyboardInput { event, .. } = event {
-            if event.state == ElementState::Pressed {
-                let amount = match event.logical_key {
-                    Key::Named(NamedKey::ArrowUp) => -self.st.line() * self.scale(),
-                    Key::Named(NamedKey::ArrowDown) => self.st.line() * self.scale(),
-                    Key::Named(NamedKey::PageUp) => -self.content_rect().3,
-                    Key::Named(NamedKey::PageDown) => self.content_rect().3,
-                    _ => 0.0,
-                };
-                self.scroll += amount;
-                self.clamp_scroll();
-            }
-        }
-        if let WindowEvent::MouseWheel { delta, .. } = event {
-            let dy = match delta {
-                MouseScrollDelta::LineDelta(_, y) => y * 3.0 * self.st.line() * self.scale(),
-                MouseScrollDelta::PixelDelta(p) => p.y as f32,
-            };
-            self.scroll -= dy;
-            self.clamp_scroll();
-        }
+        // Selection may normally open formatting controls. Preview keeps chrome inert and
+        // ensures no old popover can consume the first editor key after acceptance.
+        self.popover = None;
+        self.pop_rect = None;
+        self.pop_hits.clear();
+        self.clamp_scroll();
         self.needs_paint = true;
+        None
+    }
+
+    pub fn apply_preview_edit(&mut self, edit: PreviewEdit, event: &WindowEvent, shared: &mut Shared) -> Option<Cmd> {
+        match edit {
+            PreviewEdit::Dispatch => self.handle(event, shared),
+            PreviewEdit::Text(press) => {
+                self.apply_text_press(press, shared);
+                None
+            }
+            PreviewEdit::Table(first, column) => self.table_add(first, column, shared),
+        }
     }
 
     pub fn set_shown(&mut self, shown: bool) {

@@ -713,7 +713,7 @@ impl App {
         if self.date_preview.is_none() {
             self.run_peek_off();
             let lists = self.active_lists();
-            let snapshot = self
+            let snapshot: HashMap<_, _> = self
                 .notes
                 .iter()
                 .filter(|(_, n)| !n.closing && lists.contains(&n.list) && self.note_here(n))
@@ -736,6 +736,7 @@ impl App {
                 self.notes.iter().filter_map(|(id, n)| dates.get(&n.id).map(|day| (*id, *day))).collect();
             for (id, on) in preview.choose(day, &window_dates) {
                 if let Some(n) = self.notes.get_mut(&id) {
+                    n.begin_preview();
                     n.preview_shown(on);
                 }
             }
@@ -1106,7 +1107,7 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         if self.date_preview.is_some() {
-            use winit::event::{ElementState, Ime};
+            use winit::event::ElementState;
             use winit::keyboard::{Key, NamedKey};
             if matches!(&event, WindowEvent::KeyboardInput { event, is_synthetic: false, .. }
                 if event.state == ElementState::Pressed && event.logical_key == Key::Named(NamedKey::Escape))
@@ -1114,22 +1115,20 @@ impl ApplicationHandler<UserEvent> for App {
                 self.finish_date_preview(false);
                 return;
             }
-            let edit_intent = matches!(&event,
-                WindowEvent::KeyboardInput { event, is_synthetic: false, .. } if event.state == ElementState::Pressed
-                    && !matches!(event.logical_key, Key::Named(NamedKey::Shift | NamedKey::Control | NamedKey::Alt | NamedKey::Super | NamedKey::ArrowUp | NamedKey::ArrowDown | NamedKey::PageUp | NamedKey::PageDown)))
-                || matches!(
-                    &event,
-                    WindowEvent::MouseInput { state: ElementState::Pressed, .. } | WindowEvent::CloseRequested
-                )
-                || matches!(&event, WindowEvent::Ime(Ime::Commit(text) | Ime::Preedit(text, _)) if !text.is_empty());
-            if edit_intent {
+            let edit = self
+                .notes
+                .get_mut(&id)
+                .filter(|n| !n.closing && n.shown)
+                .and_then(|n| n.preview_event(&event, &mut self.shared));
+            if let Some(edit) = edit {
                 self.finish_date_preview(true);
-            } else {
                 if let Some(n) = self.notes.get_mut(&id) {
-                    n.preview_event(&event);
+                    if let Some(cmd) = n.apply_preview_edit(edit, &event, &mut self.shared) {
+                        self.run(el, id, cmd);
+                    }
                 }
-                return;
             }
+            return;
         }
         let Some(note) = self.notes.get_mut(&id).filter(|n| !n.closing) else { return };
         if matches!(event, WindowEvent::Focused(true)) {

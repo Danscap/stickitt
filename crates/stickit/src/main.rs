@@ -14,6 +14,7 @@ mod markdown;
 mod motion;
 mod note;
 mod popover;
+mod preview_input;
 mod reminder;
 mod store;
 mod surface;
