@@ -11,7 +11,7 @@ use crate::store::{NoteRecord, Profile, Store, DEFAULT_LIST, DEFAULT_PROFILE};
 use crate::surface;
 use crate::toast::{Toast, ToastCmd};
 use crate::tray::{Hints, Tray, TrayCmd};
-use chrono::Local;
+use chrono::{Local, NaiveDate};
 use cosmic_text::{FontSystem, SwashCache};
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::GlobalHotKeyManager;
@@ -111,6 +111,8 @@ pub struct App {
     active_profile: i64,
     /// "Hide all notes" is on.
     hidden: bool,
+    date_filter: Option<NaiveDate>,
+    date_preview: Option<crate::date_view::DatePreview<WindowId>>,
     hotkeys: Option<GlobalHotKeyManager>,
     tray: Option<Tray>,
     /// Recent closes requested by the system (taskbar, Alt+F4).
@@ -162,6 +164,8 @@ impl App {
             profiles: Vec::new(),
             active_profile,
             hidden: false,
+            date_filter: None,
+            date_preview: None,
             hotkeys: None,
             tray: None,
             system_closes: Vec::new(),
@@ -195,6 +199,7 @@ impl App {
                 profiles: self.profiles.clone(),
                 active: self.active_profile,
                 show_others: self.shared.config.desktops.dock_shows_others,
+                new_notes_on_top: self.shared.config.notes.always_on_top,
             });
         }
     }
@@ -232,9 +237,11 @@ impl App {
     /// Shows notes in their profile's lists and hides the rest (or all, when hidden). With
     /// per-desktop profiles, each note follows the profile of the desktop it is on.
     fn apply_visibility(&mut self) {
+        self.finish_date_preview(false);
         self.dock_stale = true;
         self.tray_stale = true;
         let current = self.active_lists();
+        let dates = self.store.note_dates().unwrap_or_default();
         let per_desktop = self.shared.config.desktops.profile_per_desktop;
         let mut by_desktop: HashMap<String, Vec<i64>> = HashMap::new();
         let mut shown: Vec<(WindowId, bool)> = Vec::new();
@@ -250,7 +257,9 @@ impl App {
                     .clone(),
                 None => current.clone(),
             };
-            shown.push((*id, !self.hidden && !n.user_hidden && lists.contains(&n.list)));
+            let day_matches =
+                !self.note_here(n) || self.date_filter.is_none() || dates.get(&n.id).copied() == self.date_filter;
+            shown.push((*id, !self.hidden && !n.user_hidden && lists.contains(&n.list) && day_matches));
         }
         for (id, on) in shown {
             if let Some(n) = self.notes.get_mut(&id) {
@@ -356,7 +365,7 @@ impl App {
             pos,
             size: DEFAULT_SIZE,
             color,
-            mode: 0,
+            mode: u8::from(self.shared.config.notes.always_on_top),
             zoom: 100,
             reminder: None,
             icon: String::new(),
@@ -450,17 +459,26 @@ impl App {
                 for (_, id) in &self.system_closes {
                     if let Some(n) = self.notes.get_mut(id) {
                         n.unhide();
+                        self.store.forget_closed(n.id);
                     }
                 }
                 self.hidden = true;
                 self.apply_visibility();
             }
             Cmd::Close => {
-                if let Some(n) = self.notes.get_mut(&from) {
+                let mut closed = None;
+                if let Some(n) = self.notes.get_mut(&from).filter(|n| !n.closing) {
                     if let Some(d) = self.desktops.of(&n.window) {
                         n.desktop = Some(d);
                     }
                     n.hide();
+                    closed = Some(n.id);
+                }
+                if let Some(id) = closed {
+                    // Persist hidden state/body before the close order so normal restarts
+                    // can reopen it without guessing from modification timestamps.
+                    self.flush();
+                    self.store.remember_closed(id);
                 }
                 self.dock_stale = true;
                 self.tray_stale = true;
@@ -519,8 +537,64 @@ impl App {
     // ---- dock -------------------------------------------------------------------------------
 
     fn run_dock(&mut self, el: &ActiveEventLoop, cmd: DockCmd) {
+        // Scope-changing actions end a transient preview before touching profiles or data.
+        if !matches!(
+            &cmd,
+            DockCmd::Date(_) | DockCmd::AcceptDate | DockCmd::CancelDate | DockCmd::Peek(_) | DockCmd::Opening
+        ) {
+            self.finish_date_preview(false);
+        }
         match cmd {
+            DockCmd::NewNotesOnTop(on) => {
+                let previous = self.shared.config.notes.always_on_top;
+                self.shared.config.notes.always_on_top = on;
+                if let Err(e) = self.shared.config.try_save() {
+                    self.shared.config.notes.always_on_top = previous;
+                    eprintln!("stickit: cannot save new-note setting: {e}");
+                    if let Some(dock) = self.dock.as_mut() {
+                        dock.show_error("Setting could not be saved");
+                    }
+                }
+                self.reload_model();
+            }
+            DockCmd::Date(day) => self.preview_date(day),
+            DockCmd::AcceptDate => self.finish_date_preview(true),
+            DockCmd::CancelDate => self.finish_date_preview(false),
+            DockCmd::TrashNotes(ids) => {
+                let lists = self.active_lists();
+                let ids: Vec<i64> = ids
+                    .into_iter()
+                    .filter(|id| self.notes.values().any(|n| n.id == *id && !n.closing && lists.contains(&n.list)))
+                    .collect();
+                if ids.is_empty() {
+                    return;
+                }
+                // Save selected bodies before moving records to Trash. Failure leaves every window open.
+                let recs: Vec<_> =
+                    self.notes.values().filter(|n| !n.closing && ids.contains(&n.id)).map(|n| n.record()).collect();
+                if let Err(e) = self.store.save_all(&recs).and_then(|_| self.store.trash_many(&ids)) {
+                    eprintln!("stickit: bulk Trash failed; notes kept open: {e}");
+                    if let Some(dock) = self.dock.as_mut() {
+                        dock.show_error("Trash failed; notes kept open");
+                    }
+                    return;
+                }
+                let mut undo = Vec::new();
+                for n in self.notes.values_mut().filter(|n| ids.contains(&n.id)) {
+                    n.dirty = false;
+                    n.begin_close();
+                    undo.push((n.id, n.window.current_monitor()));
+                }
+                for (id, monitor) in undo {
+                    self.offer_undo(el, id, monitor);
+                }
+                self.dock_stale = true;
+                self.tray_stale = true;
+            }
             DockCmd::Peek(id) => {
+                if self.date_preview.is_some() {
+                    return;
+                }
                 if let Some(prev) = self.peeked.take() {
                     if let Some(n) = self.notes.get_mut(&prev) {
                         n.peek(false);
@@ -542,6 +616,9 @@ impl App {
                         }
                     }
                     n.reveal(true);
+                    self.store.forget_closed(n.id);
+                    self.dock_stale = true;
+                    self.tray_stale = true;
                 }
             }
             DockCmd::NewNote => {
@@ -633,6 +710,86 @@ impl App {
         }
     }
 
+    fn note_here(&self, n: &Note) -> bool {
+        if n.shown && !n.user_hidden {
+            self.desktops.is_current(&n.window)
+        } else {
+            match (&n.desktop, &self.current_desktop) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+        }
+    }
+
+    fn preview_date(&mut self, day: Option<NaiveDate>) {
+        if self.date_preview.is_none() {
+            self.run_peek_off();
+            let lists = self.active_lists();
+            let snapshot: HashMap<_, _> = self
+                .notes
+                .iter()
+                .filter(|(_, n)| !n.closing && lists.contains(&n.list) && self.note_here(n))
+                .map(|(id, n)| {
+                    (
+                        *id,
+                        crate::date_view::Visibility {
+                            shown: n.window.is_visible().unwrap_or(n.shown),
+                            minimized: n.window.is_minimized().unwrap_or(false),
+                        },
+                    )
+                })
+                .collect();
+            self.date_preview = Some(crate::date_view::DatePreview { previous: self.date_filter, original: snapshot });
+        }
+        self.date_filter = day;
+        let dates = self.store.note_dates().unwrap_or_default();
+        if let Some(preview) = &self.date_preview {
+            let window_dates =
+                self.notes.iter().filter_map(|(id, n)| dates.get(&n.id).map(|day| (*id, *day))).collect();
+            for (id, on) in preview.choose(day, &window_dates) {
+                if let Some(n) = self.notes.get_mut(&id) {
+                    n.begin_preview();
+                    n.preview_shown(on);
+                }
+            }
+        }
+    }
+
+    fn run_peek_off(&mut self) {
+        if let Some(id) = self.peeked.take() {
+            if let Some(n) = self.notes.get_mut(&id) {
+                n.peek(false);
+            }
+        }
+    }
+
+    fn finish_date_preview(&mut self, accept: bool) {
+        let Some(preview) = self.date_preview.take() else { return };
+        self.run_peek_off();
+        let (old_filter, snapshot) = (preview.previous, preview.original);
+        if accept {
+            for id in snapshot.keys() {
+                if let Some(n) = self.notes.get_mut(id).filter(|n| n.shown && !n.closing) {
+                    n.unhide();
+                }
+            }
+            self.hidden = false;
+        } else {
+            self.date_filter = old_filter;
+            for (id, visibility) in snapshot {
+                if let Some(n) = self.notes.get_mut(&id).filter(|n| !n.closing) {
+                    n.preview_shown(visibility.shown);
+                    n.window.set_minimized(visibility.minimized);
+                }
+            }
+        }
+        if let Some(dock) = self.dock.as_mut() {
+            dock.finish_preview(accept);
+        }
+        self.dock_stale = true;
+        self.tray_stale = true;
+    }
+
     /// Dock style from stickit.ini, with the edge and height the user last dragged it to.
     fn dock_style(&self) -> crate::config::DockStyle {
         let mut style = self.shared.config.dock.clone();
@@ -649,6 +806,7 @@ impl App {
 
     /// Notes for the dock, most recently used first.
     fn dock_items(&self) -> Vec<DockItem> {
+        let dates = self.store.note_dates().unwrap_or_default();
         let mut notes: Vec<&Note> = self.notes.values().filter(|n| !n.closing).collect();
         notes.sort_by(|a, b| b.last_active.cmp(&a.last_active).then(b.id.cmp(&a.id)));
         notes
@@ -675,6 +833,7 @@ impl App {
                     hidden: n.user_hidden,
                     note: n.id,
                     trashed: false,
+                    day: dates.get(&n.id).copied(),
                 }
             })
             .chain(self.store.trashed(TRASH_LISTED).unwrap_or_default().into_iter().map(|rec| DockItem {
@@ -689,6 +848,7 @@ impl App {
                 hidden: false,
                 note: rec.id,
                 trashed: true,
+                day: dates.get(&rec.id).copied(),
             }))
             .collect()
     }
@@ -708,6 +868,7 @@ impl App {
             |a: GlobalAction| self.shared.config.global.iter().find(|(g, _)| *g == a).map_or("", |(_, b)| b.as_str());
         let hints = Hints {
             new_note: hint(GlobalAction::NewNote),
+            reopen_last_closed: hint(GlobalAction::ReopenLastClosed),
             paste_as_note: hint(GlobalAction::PasteAsNote),
             open_dock: hint(GlobalAction::OpenDock),
             toggle_notes: hint(GlobalAction::ToggleNotes),
@@ -738,6 +899,7 @@ impl App {
     fn run_tray(&mut self, el: &ActiveEventLoop, cmd: TrayCmd) {
         match cmd {
             TrayCmd::NewNote => self.run_global(el, GlobalAction::NewNote),
+            TrayCmd::ReopenLastClosed => self.run_global(el, GlobalAction::ReopenLastClosed),
             TrayCmd::PasteAsNote => self.run_global(el, GlobalAction::PasteAsNote),
             TrayCmd::ToggleNotes => self.run_global(el, GlobalAction::ToggleNotes),
             TrayCmd::Settings => self.open_settings(),
@@ -812,6 +974,22 @@ impl App {
             GlobalAction::NewNote => {
                 let color = self.next_color();
                 self.create(el, "", color, None, true);
+            }
+            GlobalAction::ReopenLastClosed => {
+                self.finish_date_preview(false);
+                self.flush();
+                let lists = self.active_lists();
+                let available: Vec<_> = self
+                    .notes
+                    .values()
+                    .filter(|n| !n.closing && n.user_hidden && lists.contains(&n.list))
+                    .map(|n| n.id)
+                    .collect();
+                if let Some(id) = self.store.last_closed(&available) {
+                    // Shares the existing tray/dock bring-forward path, without opening
+                    // the dock, selecting another profile, or creating an empty note.
+                    self.run_tray(el, TrayCmd::Reveal(id));
+                }
             }
             GlobalAction::PasteAsNote => {
                 let text = self.shared.clipboard.as_mut().and_then(|c| c.get_text().ok()).unwrap_or_default();
@@ -922,6 +1100,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn user_event(&mut self, el: &ActiveEventLoop, event: UserEvent) {
+        self.finish_date_preview(false);
         match event {
             UserEvent::Hotkey(id) => {
                 if let Some(&(_, action)) = self.bindings.iter().find(|(hk, _)| hk.id() == id) {
@@ -957,6 +1136,30 @@ impl ApplicationHandler<UserEvent> for App {
             }
             return;
         }
+        if self.date_preview.is_some() {
+            use winit::event::ElementState;
+            use winit::keyboard::{Key, NamedKey};
+            if matches!(&event, WindowEvent::KeyboardInput { event, is_synthetic: false, .. }
+                if event.state == ElementState::Pressed && event.logical_key == Key::Named(NamedKey::Escape))
+            {
+                self.finish_date_preview(false);
+                return;
+            }
+            let edit = self
+                .notes
+                .get_mut(&id)
+                .filter(|n| !n.closing && n.shown)
+                .and_then(|n| n.preview_event(&event, &mut self.shared));
+            if let Some(edit) = edit {
+                self.finish_date_preview(true);
+                if let Some(n) = self.notes.get_mut(&id) {
+                    if let Some(cmd) = n.apply_preview_edit(edit, &event, &mut self.shared) {
+                        self.run(el, id, cmd);
+                    }
+                }
+            }
+            return;
+        }
         let Some(note) = self.notes.get_mut(&id).filter(|n| !n.closing) else { return };
         if matches!(event, WindowEvent::Focused(true)) {
             // What the note menu offers under "Move to desktop" (nothing when notes show on
@@ -974,18 +1177,22 @@ impl ApplicationHandler<UserEvent> for App {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let now = Instant::now();
         let ts = Local::now().timestamp();
+        if self.date_preview.is_some() && self.notes.values().any(|n| n.due(ts)) {
+            self.finish_date_preview(false);
+        }
         let mut next: Option<Instant> = None;
         let mut wake = |t: Instant| next = Some(next.map_or(t, |n: Instant| n.min(t)));
 
         let mut dirty = false;
         for note in self.notes.values_mut() {
-            if note.due(ts) {
+            if self.date_preview.is_none() && note.due(ts) {
+                self.store.forget_closed(note.id);
                 note.ring(self.shared.config.reminders.sound);
             }
             if let Some(t) = note.tick(now) {
                 wake(t);
             }
-            if let Some(r) = note.reminder.as_ref().filter(|_| !note.ringing) {
+            if let Some(r) = note.reminder.as_ref().filter(|_| !note.ringing && self.date_preview.is_none()) {
                 let secs = (r.due - ts).max(0) as u64;
                 wake(now + Duration::from_secs(secs).min(REMINDER_POLL));
             }
@@ -1097,6 +1304,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
+        self.finish_date_preview(false);
         if self.bench.is_none() {
             // Save everything once more so each note's desktop is recorded.
             for n in self.notes.values_mut() {

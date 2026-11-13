@@ -120,6 +120,8 @@ pub struct NoteStyle {
     pub appear_scale: f32,
     /// Colour of new notes.
     pub default_color: NewNoteColor,
+    /// New notes always on top; existing note modes are independent.
+    pub always_on_top: bool,
     pub compact: CompactStyle,
     pub fade: FadeStyle,
     /// + buttons on a table's edges to add a row or a column (the row and column menus do it too).
@@ -266,6 +268,7 @@ impl Default for NoteStyle {
             cover: 1.0,
             appear_scale: 0.97,
             default_color: NewNoteColor::Cycle,
+            always_on_top: false,
             compact: CompactStyle::default(),
             fade: FadeStyle::default(),
             table_buttons: false,
@@ -366,6 +369,7 @@ macro_rules! actions {
 
 actions!(GlobalAction {
     NewNote = "new_note", "CmdOrCtrl+Alt+N", "Create a note from anywhere";
+    ReopenLastClosed = "reopen_last_closed", "CmdOrCtrl+Alt+Shift+N", "Reopen the last closed note in the current profile";
     PasteAsNote = "paste_as_note", "CmdOrCtrl+Alt+V", "Turn the clipboard into a new note";
     ToggleNotes = "toggle_notes", "CmdOrCtrl+Alt+H", "Hide or show every note";
     OpenDock = "open_dock", "CmdOrCtrl+Alt+D", "Slide the dock out (or tuck it away)";
@@ -583,6 +587,13 @@ const SETTINGS: &[Setting] = &[
         doc: "+ buttons on a table's edges to add a row or a column (its menus can too)",
         get: |c| c.notes.table_buttons.to_string(),
         set: |c, v| c.notes.table_buttons = flag(v).unwrap_or(c.notes.table_buttons),
+    },
+    Setting {
+        section: "notes",
+        key: "always_on_top",
+        doc: "New notes always on top (existing notes keep their window mode)",
+        get: |c| c.notes.always_on_top.to_string(),
+        set: |c, v| c.notes.always_on_top = flag(v).unwrap_or(c.notes.always_on_top),
     },
     // [notes.compact]
     num_setting!("notes.compact", "height", 24.0, 80.0, notes.compact.height, "height of the one-line note"),
@@ -928,10 +939,14 @@ impl Config {
     /// Writes the settings back to the file (after a change made in the app, e.g. resizing the
     /// dock with Ctrl+wheel). Values the user wrote are kept; comments are regenerated.
     pub fn save(&mut self) {
-        let Some(path) = self.path.clone() else { return };
-        if std::fs::write(&path, self.render()).is_ok() {
-            self.modified = modified(&path);
-        }
+        let _ = self.try_save();
+    }
+
+    pub fn try_save(&mut self) -> std::io::Result<()> {
+        let Some(path) = self.path.clone() else { return Ok(()) };
+        std::fs::write(&path, self.render())?;
+        self.modified = modified(&path);
+        Ok(())
     }
 
     /// Re-reads the file if it changed on disk. Returns true when settings changed.
@@ -1020,7 +1035,11 @@ impl Config {
              # \"Settings...\" (and otherwise the next time the dock opens).\n\n"
         );
         let line = |key: &str, value: &str, doc: &str| {
-            if doc.is_empty() {
+            if value.is_empty() && !doc.is_empty() {
+                // A comment after an empty value would be parsed as the value itself
+                // (leading '#' is also valid for colour settings). Keep disabled chords empty.
+                format!("# {doc}\n{key:<26}=\n")
+            } else if doc.is_empty() {
                 format!("{key:<26}= {value}\n")
             } else {
                 format!("{key:<26}= {value:<10} # {doc}\n")
@@ -1085,6 +1104,40 @@ fn parse_hex(value: &str) -> Option<Rgb> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reopen_shortcut_defaults_upgrade_remap_and_disable() {
+        let defaults = Config::defaults();
+        let action = GlobalAction::ReopenLastClosed;
+        let binding = action.default_binding();
+        assert_eq!(binding, "CmdOrCtrl+Alt+Shift+N");
+        let hotkey = binding.parse::<global_hotkey::hotkey::HotKey>().unwrap();
+        for (other, shortcut) in &defaults.global {
+            if *other != action {
+                assert_ne!(hotkey.id(), shortcut.parse::<global_hotkey::hotkey::HotKey>().unwrap().id());
+            }
+        }
+        let old =
+            defaults.render().lines().filter(|l| !l.starts_with("reopen_last_closed")).collect::<Vec<_>>().join("\n");
+        assert!(lacks_settings(&old));
+        assert!(Config::parse(&old).global.iter().any(|(a, b)| *a == action && b == binding));
+        for binding in ["Ctrl+Alt+Shift+R", ""] {
+            let cfg = Config::parse(&format!("[shortcuts.global]\nreopen_last_closed = {binding}\n"));
+            let again = Config::parse(&cfg.render());
+            assert!(again.global.iter().any(|(a, b)| *a == action && b == binding));
+        }
+    }
+
+    #[test]
+    fn new_note_mode_setting_defaults_and_roundtrips() {
+        assert!(!Config::defaults().notes.always_on_top);
+        assert!(!Config::parse("[notes]\nfont_size=16").notes.always_on_top);
+        for (value, expected) in [("true", true), ("false", false), ("invalid", false)] {
+            let cfg = Config::parse(&format!("[notes]\nalways_on_top={value}"));
+            assert_eq!(cfg.notes.always_on_top, expected);
+            assert_eq!(Config::parse(&cfg.render()).notes.always_on_top, expected);
+        }
+    }
 
     #[test]
     fn defaults_roundtrip_through_the_generated_file() {
