@@ -120,6 +120,8 @@ pub struct NoteStyle {
     pub appear_scale: f32,
     /// Colour of new notes.
     pub default_color: NewNoteColor,
+    /// New notes always on top; existing note modes are independent.
+    pub always_on_top: bool,
     pub compact: CompactStyle,
     pub fade: FadeStyle,
     /// + buttons on a table's edges to add a row or a column (the row and column menus do it too).
@@ -266,6 +268,7 @@ impl Default for NoteStyle {
             cover: 1.0,
             appear_scale: 0.97,
             default_color: NewNoteColor::Cycle,
+            always_on_top: false,
             compact: CompactStyle::default(),
             fade: FadeStyle::default(),
             table_buttons: false,
@@ -583,6 +586,13 @@ const SETTINGS: &[Setting] = &[
         doc: "+ buttons on a table's edges to add a row or a column (its menus can too)",
         get: |c| c.notes.table_buttons.to_string(),
         set: |c, v| c.notes.table_buttons = flag(v).unwrap_or(c.notes.table_buttons),
+    },
+    Setting {
+        section: "notes",
+        key: "always_on_top",
+        doc: "New notes always on top (existing notes keep their window mode)",
+        get: |c| c.notes.always_on_top.to_string(),
+        set: |c, v| c.notes.always_on_top = flag(v).unwrap_or(c.notes.always_on_top),
     },
     // [notes.compact]
     num_setting!("notes.compact", "height", 24.0, 80.0, notes.compact.height, "height of the one-line note"),
@@ -928,10 +938,14 @@ impl Config {
     /// Writes the settings back to the file (after a change made in the app, e.g. resizing the
     /// dock with Ctrl+wheel). Values the user wrote are kept; comments are regenerated.
     pub fn save(&mut self) {
-        let Some(path) = self.path.clone() else { return };
-        if std::fs::write(&path, self.render()).is_ok() {
-            self.modified = modified(&path);
-        }
+        let _ = self.try_save();
+    }
+
+    pub fn try_save(&mut self) -> std::io::Result<()> {
+        let Some(path) = self.path.clone() else { return Ok(()) };
+        std::fs::write(&path, self.render())?;
+        self.modified = modified(&path);
+        Ok(())
     }
 
     /// Re-reads the file if it changed on disk. Returns true when settings changed.
@@ -1085,6 +1099,17 @@ fn parse_hex(value: &str) -> Option<Rgb> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_note_mode_setting_defaults_and_roundtrips() {
+        assert!(!Config::defaults().notes.always_on_top);
+        assert!(!Config::parse("[notes]\nfont_size=16").notes.always_on_top);
+        for (value, expected) in [("true", true), ("false", false), ("invalid", false)] {
+            let cfg = Config::parse(&format!("[notes]\nalways_on_top={value}"));
+            assert_eq!(cfg.notes.always_on_top, expected);
+            assert_eq!(Config::parse(&cfg.render()).notes.always_on_top, expected);
+        }
+    }
 
     #[test]
     fn defaults_roundtrip_through_the_generated_file() {

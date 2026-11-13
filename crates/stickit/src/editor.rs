@@ -210,6 +210,26 @@ impl Doc {
         self.insert_other("\n");
     }
 
+    /// Insert a child task using the same two-space indentation as Tab. A selection,
+    /// marker-prefix caret or fenced code is not an active checklist editing context.
+    pub fn subtask(&mut self) -> bool {
+        let (ls, le) = self.line_bounds(self.cursor);
+        let line = &self.text[ls..le];
+        let info = line_info(line);
+        let fenced = self.text[..ls].lines().filter(|l| l.trim_start().starts_with("```")).count() % 2 != 0;
+        if self.selection().is_some()
+            || fenced
+            || info.checkbox.is_none()
+            || self.cursor < ls + info.content_start(line)
+        {
+            return false;
+        }
+        let marker = &line[info.indent..info.marker_end];
+        let child_marker = if info.ordered.is_some() { "1. " } else { marker };
+        self.insert_other(&format!("\n{}  {child_marker}[ ] ", &line[..info.indent]));
+        true
+    }
+
     fn insert_other(&mut self, s: &str) {
         let range = self.selection().unwrap_or(self.cursor..self.cursor);
         self.replace(range, s, EditKind::Other);
@@ -649,6 +669,25 @@ mod tests {
         assert_eq!(d.text, "- [x] milk\n- [ ] ");
         d.newline();
         assert_eq!(d.text, "- [x] milk\n");
+    }
+
+    #[test]
+    fn child_tasks_preserve_text_and_undo() {
+        let mut d = doc("  - [x] café tail");
+        d.cursor = "  - [x] café".len();
+        assert!(d.subtask());
+        assert_eq!(d.text, "  - [x] café\n    - [ ]  tail");
+        d.undo();
+        assert_eq!(d.text, "  - [x] café tail");
+        assert_eq!(d.cursor, "  - [x] café".len());
+        d.redo();
+        assert_eq!(d.text, "  - [x] café\n    - [ ]  tail");
+        for text in ["ordinary", "- bullet", "```\n- [ ] code"] {
+            assert!(!doc(text).subtask());
+        }
+        let mut d = doc("- [ ] ");
+        assert!(d.subtask());
+        assert_eq!(d.text, "- [ ] \n  - [ ] ");
     }
 
     #[test]

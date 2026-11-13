@@ -65,7 +65,7 @@ for a new one. On macOS, <kbd>Ctrl</kbd> in every shortcut here is <kbd>⌘</kbd
 
 Write in Markdown and it formats as you type: `#` headings, `- [ ]` to-dos, `-` lists, `>`
 quotes, `` ` `` code and links. Type `/` at the start of a line for a menu of blocks, and
-`:name:` for an emoji. Click a to-do's box (or press <kbd>Ctrl</kbd>+<kbd>Enter</kbd>) to tick it.
+`:name:` for an emoji. Click a to-do's box to tick it. In a checklist, <kbd>Enter</kbd> adds an unchecked task at the same level; an empty item ends the list. <kbd>Ctrl</kbd>+<kbd>Enter</kbd> adds a new unchecked child task with two more spaces of indentation, as with Tab. Each insertion is one undo step. Outside checklist context, existing shortcuts remain unchanged.
 <kbd>Ctrl</kbd>+<kbd>=</kbd> and <kbd>Ctrl</kbd>+<kbd>-</kbd> zoom the text.
 
 Select text and a toolbar appears over it: **B**old, *I*talic, ~~S~~trikethrough, `</>` code,
@@ -231,6 +231,31 @@ The tray icon (menu bar on macOS) has a new note, paste as note, the dock, hide 
 note (<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>H</kbd>), a list of hidden notes, settings and quit. Closing the windows from the taskbar
 sends Stick-itt to the tray rather than quitting.
 
+### Dates, previews and selection
+
+The dock's **All / Today / Yesterday / Calendar** controls use local creation dates.
+On the first upgrade, all existing notes receive that upgrade day's effective date, once.
+Original creation and modification timestamps are preserved. A `stickit.pre-dates-*.db`
+SQLite backup is written beside an existing database before migration; a failed backup
+stops the upgrade. New notes retain the local day on which they were created, including
+across timezone changes. Trashed notes retain their date when restored.
+
+Choose a day to preview its actual windows within the current profile and desktop.
+Choosing another day replaces the preview while keeping the original rollback snapshot.
+**Accept** keeps the chosen windows open; **Never Mind** or Escape restores prior visibility.
+An empty day previews no windows. Preview permits scrolling; typing or clicking a note
+accepts it before that action runs. Other profiles/desktops are not moved or changed.
+A due reminder cancels a preview before ringing. Date filtering is session-only. In icon view, the dock's right-click menu opens date navigation.
+Tab / Shift+Tab move focus among controls, and Enter activates the focused control.
+
+**Select** turns note icons into checkboxes. **Select All** selects the note cards currently
+shown by the active date/search/profile filters and expanded groups. **Trash** previews
+that selection's count. **Move all except today to Trash…** ignores dock date/search filters
+but stays within the current profile, including its hidden notes and other desktops.
+The confirmation gives the exact count and explicitly keeps today's notes. Cancel leaves
+notes alone. Confirm uses recoverable Trash and grouped Undo, with the existing retention
+policy (`trash_days`, normally 30 days); it never purges notes directly.
+
 ### Shortcuts
 
 | Anywhere | | In a note | |
@@ -244,7 +269,7 @@ sends Stick-itt to the tray rather than quitting.
 | | | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd> | Pick an icon |
 | | | <kbd>Ctrl</kbd>+<kbd>B</kbd> <kbd>I</kbd> <kbd>E</kbd>, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> | Bold, italic, code, strikethrough |
 | | | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>H</kbd> | Highlight |
-| | | <kbd>Ctrl</kbd>+<kbd>Enter</kbd> | Tick a to-do |
+| | | <kbd>Ctrl</kbd>+<kbd>Enter</kbd> | Add a child task in a checklist |
 | | | <kbd>Ctrl</kbd>+<kbd>W</kbd> / <kbd>Ctrl</kbd>+<kbd>D</kbd> | Hide / delete |
 
 Every shortcut can be changed or turned off in the settings file.
@@ -297,6 +322,7 @@ width         = 220
 
 | Key | Default | |
 |---|---|---|
+| `always_on_top` | `false` | New notes always on top; existing notes keep their individual modes. Also available in the dock menu. |
 | `default_color` | `cycle` | Colour of new notes: `cycle`, `random`, a name (`lavender`, `cobalt`, `yellow`…) or a hue `0`–`359` |
 | `font_size` | `14.5` | |
 | `line_height` | `1.5` | Multiple of the font size |

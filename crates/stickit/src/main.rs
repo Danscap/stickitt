@@ -3,6 +3,7 @@
 mod app;
 mod chime;
 mod config;
+mod date_view;
 mod desktops;
 mod dock;
 mod editor;
@@ -77,7 +78,9 @@ fn main() {
     if shots.is_some() {
         bench = Some(0);
     }
-    let data_dir = data_dir();
+    // Explicit fixture databases keep logs/default config beside the fixture too; never
+    // inspect or migrate the normal user data directory during isolated QA.
+    let data_dir = db_path.as_ref().and_then(|p| p.parent()).map(PathBuf::from).unwrap_or_else(data_dir);
     // A crash leaves its message in the data folder: a bundled app has no terminal to show it.
     log_panics(data_dir.join("stickit.log"));
     let db_path = db_path.unwrap_or_else(|| data_dir.join("stickit.db"));

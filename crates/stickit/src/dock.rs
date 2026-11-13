@@ -17,6 +17,7 @@ use crate::note::{ellipsized, label_width, small_label, Shared};
 use crate::store::{List, Profile, DEFAULT_LIST, DEFAULT_PROFILE};
 use crate::surface::{self, Surface};
 use crate::theme::{self, palette, Palette, Rgb};
+use chrono::{Datelike, Local, Months, NaiveDate};
 use cosmic_text::{Buffer, FontSystem, Weight};
 use std::collections::HashSet;
 use std::error::Error;
@@ -73,6 +74,7 @@ pub struct DockItem {
     pub note: i64,
     /// In the trash (no window; clicking it restores it).
     pub trashed: bool,
+    pub day: Option<NaiveDate>,
 }
 
 #[derive(Clone, Default, PartialEq)]
@@ -82,6 +84,7 @@ pub struct DockModel {
     pub active: i64,
     /// List notes from other virtual desktops too (in their own group).
     pub show_others: bool,
+    pub new_notes_on_top: bool,
 }
 
 impl DockModel {
@@ -116,6 +119,11 @@ impl View {
 }
 
 pub enum DockCmd {
+    NewNotesOnTop(bool),
+    Date(Option<NaiveDate>),
+    AcceptDate,
+    CancelDate,
+    TrashNotes(Vec<i64>),
     Focus(WindowId),
     Peek(Option<WindowId>),
     NewNote,
@@ -153,6 +161,18 @@ pub enum DockCmd {
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Hit {
+    NewNotesOnTop,
+    Date(Option<NaiveDate>),
+    Calendar,
+    Month(i32),
+    AcceptDate,
+    CancelDate,
+    Select,
+    SelectAll,
+    DeleteSelected,
+    ExceptToday,
+    ConfirmBulk,
+    CancelBulk,
     Note(usize),
     New,
     SetView(View),
@@ -184,6 +204,7 @@ enum InputKind {
 }
 
 enum RowKind {
+    Controls(Vec<(String, Hit)>),
     Section {
         title: String,
         count: usize,
@@ -276,6 +297,15 @@ pub struct Dock {
     input: Option<(InputKind, String)>,
     /// Type-to-filter text (when the dock has keyboard focus).
     query: String,
+    date: Option<NaiveDate>,
+    preview: Option<Option<NaiveDate>>,
+    calendar: bool,
+    month: NaiveDate,
+    selecting: bool,
+    selected: HashSet<i64>,
+    bulk: Option<(String, Vec<i64>, Option<NaiveDate>)>,
+    status: Option<String>,
+    shift: bool,
     /// Pointer offset inside the window while the dock is being dragged.
     drag: Option<(f64, f64)>,
     /// The tab being dragged along its edge: pointer's screen y and the position at the press,
@@ -314,6 +344,19 @@ fn inside(r: (f32, f32, f32, f32), x: f32, y: f32) -> bool {
 fn falloff(distance: f32, reach: f32) -> f32 {
     let d = (distance.abs() / reach).min(1.0);
     (1.0 + (std::f32::consts::PI * d).cos()) / 2.0
+}
+
+/// Bulk scope deliberately ignores the dock's search/date filter for "except today".
+fn bulk_targets(items: &[DockItem], lists: &[i64], selected: &HashSet<i64>, except: Option<NaiveDate>) -> Vec<i64> {
+    items
+        .iter()
+        .filter(|it| !it.trashed && lists.contains(&it.list))
+        .filter(|it| match except {
+            Some(today) => it.day.is_some_and(|d| d != today),
+            None => selected.contains(&it.note),
+        })
+        .map(|it| it.note)
+        .collect()
 }
 
 impl Dock {
@@ -372,6 +415,15 @@ impl Dock {
             deleting: None,
             input: None,
             query: String::new(),
+            date: None,
+            preview: None,
+            calendar: false,
+            month: Local::now().date_naive().with_day(1).unwrap(),
+            selecting: false,
+            selected: HashSet::new(),
+            bulk: None,
+            status: None,
+            shift: false,
             drag: None,
             tab_drag: None,
             rest: false,
@@ -436,6 +488,8 @@ impl Dock {
 
     pub fn set_model(&mut self, model: DockModel) {
         if model != self.model {
+            self.selected.clear();
+            self.bulk = None;
             self.model = model;
             self.refresh();
         }
@@ -537,6 +591,8 @@ impl Dock {
             return rows;
         }
         if self.menu {
+            push(MENU_ROW_H, Some(Hit::Calendar), RowKind::Add("Calendar / date navigation"), &mut rows);
+            push(MENU_ROW_H, Some(Hit::Select), RowKind::Add("Select notes / bulk Trash"), &mut rows);
             push(MENU_ROW_H - 4.0, None, RowKind::Caption("PROFILES".into()), &mut rows);
             for p in &self.model.profiles {
                 let delete = (p.id != DEFAULT_PROFILE).then_some(Hit::DeleteProfile(p.id));
@@ -586,11 +642,120 @@ impl Dock {
             }
             let trashed = self.items.iter().filter(|it| it.trashed).count();
             push(MENU_ROW_H + 6.0, Some(Hit::OpenTrash), RowKind::TrashLink(trashed), &mut rows);
+            push(
+                MENU_ROW_H,
+                Some(Hit::NewNotesOnTop),
+                RowKind::Choice {
+                    label: "New notes always on top".into(),
+                    on: self.model.new_notes_on_top,
+                    radio: false,
+                    delete: None,
+                },
+                &mut rows,
+            );
             push(MENU_ROW_H, Some(Hit::Settings), RowKind::Add("Settings…"), &mut rows);
             push(MENU_ROW_H, Some(Hit::Quit), RowKind::Add("Quit Stick-itt"), &mut rows);
             return rows;
         }
 
+        if let Some(status) = &self.status {
+            push(30.0, None, RowKind::Controls(vec![(status.clone(), Hit::Input)]), &mut rows);
+        }
+        let today = Local::now().date_naive();
+        push(
+            34.0,
+            None,
+            RowKind::Controls(vec![
+                ("All".into(), Hit::Date(None)),
+                ("Today".into(), Hit::Date(Some(today))),
+                ("Yesterday".into(), Hit::Date(today.pred_opt())),
+                ("Calendar".into(), Hit::Calendar),
+            ]),
+            &mut rows,
+        );
+        if self.calendar {
+            push(
+                32.0,
+                None,
+                RowKind::Controls(vec![
+                    ("‹".into(), Hit::Month(-1)),
+                    (self.month.format("%B %Y").to_string(), Hit::Calendar),
+                    ("›".into(), Hit::Month(1)),
+                ]),
+                &mut rows,
+            );
+            push(
+                24.0,
+                None,
+                RowKind::Controls(
+                    ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].into_iter().map(|s| (s.into(), Hit::Input)).collect(),
+                ),
+                &mut rows,
+            );
+            let first = self.month.weekday().num_days_from_monday() as usize;
+            let days = (self.month.checked_add_months(Months::new(1)).unwrap() - self.month).num_days() as usize;
+            for week in 0..(first + days).div_ceil(7) {
+                let mut cells = Vec::new();
+                for weekday in 0..7 {
+                    let slot = week * 7 + weekday;
+                    let day = slot.checked_sub(first).map(|d| d + 1).filter(|&d| d <= days);
+                    cells.push(match day {
+                        Some(d) => (d.to_string(), Hit::Date(self.month.with_day(d as u32))),
+                        None => (String::new(), Hit::Input),
+                    });
+                }
+                push(30.0, None, RowKind::Controls(cells), &mut rows);
+            }
+        }
+        if self.preview.is_some() {
+            push(
+                30.0,
+                None,
+                RowKind::Controls(vec![("Accept".into(), Hit::AcceptDate), ("Never Mind".into(), Hit::CancelDate)]),
+                &mut rows,
+            );
+        }
+        let scope = self.date.map_or("All dates".into(), |d| d.to_string());
+        push(
+            28.0,
+            None,
+            RowKind::Controls(vec![(format!("{scope} · {} selected", self.selected.len()), Hit::Select)]),
+            &mut rows,
+        );
+        push(
+            30.0,
+            None,
+            RowKind::Controls(vec![
+                (if self.selecting { "Done" } else { "Select" }.into(), Hit::Select),
+                ("Select All".into(), Hit::SelectAll),
+                ("Trash".into(), Hit::DeleteSelected),
+            ]),
+            &mut rows,
+        );
+        push(
+            30.0,
+            None,
+            RowKind::Controls(vec![("Move all except today to Trash…".into(), Hit::ExceptToday)]),
+            &mut rows,
+        );
+        if let Some((label, ids, _)) = &self.bulk {
+            push(
+                30.0,
+                None,
+                RowKind::Controls(vec![(format!("Current profile · {} notes", ids.len()), Hit::Input)]),
+                &mut rows,
+            );
+            push(30.0, None, RowKind::Controls(vec![(label.clone(), Hit::Input)]), &mut rows);
+            push(
+                30.0,
+                None,
+                RowKind::Controls(vec![
+                    ("Confirm → Trash".into(), Hit::ConfirmBulk),
+                    ("Cancel".into(), Hit::CancelBulk),
+                ]),
+                &mut rows,
+            );
+        }
         let note_h = self.note_h();
         if !self.query.is_empty() {
             push(SECTION_H, None, RowKind::Search, &mut rows);
@@ -639,7 +804,13 @@ impl Dock {
             }
         }
         if none {
-            let text = if self.query.is_empty() { "No notes in this profile yet" } else { "No matching notes" };
+            let text = if self.date.is_some() {
+                "No notes on this date"
+            } else if self.query.is_empty() {
+                "No notes in this profile yet"
+            } else {
+                "No matching notes"
+            };
             push(note_h + self.style.card_gap, None, RowKind::Empty(text), &mut rows);
         }
         push(note_h + self.style.card_gap, Some(Hit::New), RowKind::NewNote, &mut rows);
@@ -648,7 +819,12 @@ impl Dock {
 
     /// The icon strip is used unless the menu is open (the menu is always a list).
     fn icons(&self) -> bool {
-        self.view == View::Icons && !self.menu
+        self.view == View::Icons
+            && !self.menu
+            && !self.calendar
+            && !self.selecting
+            && self.date.is_none()
+            && self.preview.is_none()
     }
 
     /// Notes (not in the trash) in a list.
@@ -657,6 +833,9 @@ impl Dock {
     }
 
     fn matches(&self, i: usize) -> bool {
+        if self.date.is_some() && self.items[i].day != self.date {
+            return false;
+        }
         if self.query.is_empty() {
             return true;
         }
@@ -946,7 +1125,13 @@ impl Dock {
                 );
                 inside(band, x, y)
             })
-            .and_then(|c| rows[c.row].hit)
+            .and_then(|c| match &rows[c.row].kind {
+                RowKind::Controls(cells) => {
+                    let i = (((x - c.rect.0) / c.rect.2) * cells.len() as f32).floor() as usize;
+                    cells.get(i).filter(|(label, _)| !label.is_empty()).map(|(_, hit)| *hit)
+                }
+                _ => rows[c.row].hit,
+            })
     }
 
     fn start(&mut self, open: bool) {
@@ -1017,7 +1202,7 @@ impl Dock {
         }
         self.open_at = None;
         self.magnify.to(0.0);
-        if self.want_open && self.input.is_none() {
+        if self.want_open && self.input.is_none() && self.preview.is_none() && self.bulk.is_none() {
             self.close_at = Some(Instant::now() + CLOSE_DELAY);
         }
         self.peek_at = None;
@@ -1157,9 +1342,116 @@ impl Dock {
 
     fn click(&mut self, hit: Hit) -> Option<DockCmd> {
         self.needs_paint = true;
+        self.status = None;
         let cmd = match hit {
+            Hit::NewNotesOnTop => DockCmd::NewNotesOnTop(!self.model.new_notes_on_top),
+            Hit::Date(day) => {
+                if self.preview.is_none() {
+                    self.preview = Some(self.date);
+                }
+                self.date = day;
+                self.selected.clear();
+                self.bulk = None;
+                self.scroll.snap_to(0.0);
+                self.window.focus_window();
+                self.refresh();
+                DockCmd::Date(day)
+            }
+            Hit::Calendar => {
+                self.menu = false;
+                self.calendar = !self.calendar;
+                self.window.focus_window();
+                self.refresh();
+                return None;
+            }
+            Hit::Month(delta) => {
+                self.month = if delta < 0 {
+                    self.month.checked_sub_months(Months::new(1))
+                } else {
+                    self.month.checked_add_months(Months::new(1))
+                }
+                .unwrap_or(self.month);
+                self.refresh();
+                return None;
+            }
+            Hit::AcceptDate => {
+                self.finish_preview(true);
+                DockCmd::AcceptDate
+            }
+            Hit::CancelDate => {
+                self.finish_preview(false);
+                DockCmd::CancelDate
+            }
+            Hit::Select => {
+                self.menu = false;
+                self.selecting = !self.selecting;
+                self.bulk = None;
+                if !self.selecting {
+                    self.selected.clear();
+                }
+                self.window.focus_window();
+                self.refresh();
+                return None;
+            }
+            Hit::SelectAll => {
+                self.selecting = true;
+                self.selected = self
+                    .rows()
+                    .iter()
+                    .filter_map(|r| match r.kind {
+                        RowKind::Note(i) => Some(self.items[i].note),
+                        _ => None,
+                    })
+                    .collect();
+                self.bulk = None;
+                self.refresh();
+                return None;
+            }
+            Hit::DeleteSelected | Hit::ExceptToday => {
+                let today = Local::now().date_naive();
+                let lists = self.model.profile().map(|p| p.lists.clone()).unwrap_or_default();
+                let ids = bulk_targets(&self.items, &lists, &self.selected, (hit == Hit::ExceptToday).then_some(today));
+                self.bulk = Some((
+                    if hit == Hit::ExceptToday {
+                        "Today kept · recover in Trash"
+                    } else {
+                        "Selected notes · recover in Trash"
+                    }
+                    .into(),
+                    ids,
+                    (hit == Hit::ExceptToday).then_some(today),
+                ));
+                self.refresh();
+                return None;
+            }
+            Hit::ConfirmBulk => {
+                let (_, ids, day) = self.bulk.take()?;
+                // Crossing local midnight changes "today"; show the new exact scope and
+                // require another confirmation rather than applying a stale date promise.
+                if day.is_some_and(|d| d != Local::now().date_naive()) {
+                    return self.click(Hit::ExceptToday);
+                }
+                self.selected.clear();
+                self.refresh();
+                DockCmd::TrashNotes(ids)
+            }
+            Hit::CancelBulk => {
+                self.bulk = None;
+                self.refresh();
+                return None;
+            }
+
             Hit::Note(i) => {
                 let item = self.items.get(i)?;
+                if self.selecting && !item.trashed {
+                    let id = item.note;
+                    if !self.selected.remove(&id) {
+                        self.selected.insert(id);
+                    }
+                    self.bulk = None;
+                    self.refresh();
+                    return None;
+                }
                 let cmd = if item.trashed { DockCmd::Restore(item.note) } else { DockCmd::Focus(item.id) };
                 if self.menu {
                     self.toggle_menu();
@@ -1273,6 +1565,45 @@ impl Dock {
 
     /// Keyboard navigation (when the dock has focus): ↑/↓ select, Enter opens, typing filters.
     fn navigate(&mut self, key: &Key, text: Option<&str>) -> Option<DockCmd> {
+        if *key == Key::Named(NamedKey::Escape) && self.preview.is_some() {
+            return self.click(Hit::CancelDate);
+        }
+        if *key == Key::Named(NamedKey::Escape) && self.bulk.is_some() {
+            return self.click(Hit::CancelBulk);
+        }
+        if *key == Key::Named(NamedKey::Tab) {
+            let mut hits = Vec::new();
+            for row in self.rows() {
+                match row.kind {
+                    RowKind::Controls(cells) => hits.extend(
+                        cells.into_iter().filter(|(s, h)| !s.is_empty() && *h != Hit::Input).map(|(_, h)| (h, row.y)),
+                    ),
+                    _ => {
+                        if let Some(hit) = row.hit {
+                            hits.push((hit, row.y));
+                        }
+                    }
+                }
+            }
+            let next = self.hover.and_then(|h| hits.iter().position(|(hit, _)| *hit == h)).map_or(0, |i| {
+                if self.shift {
+                    (i + hits.len() - 1) % hits.len().max(1)
+                } else {
+                    (i + 1) % hits.len().max(1)
+                }
+            });
+            if let Some((hit, y)) = hits.get(next) {
+                self.hover = Some(*hit);
+                self.scroll.to(*y);
+                self.needs_paint = true;
+            }
+            return None;
+        }
+        if *key == Key::Named(NamedKey::Enter) {
+            if let Some(hit) = self.hover {
+                return self.click(hit);
+            }
+        }
         let notes: Vec<(usize, f32, f32)> = self
             .rows()
             .iter()
@@ -1329,17 +1660,41 @@ impl Dock {
             }
             Key::Named(NamedKey::Backspace) => {
                 self.query.pop();
+                self.selected.clear();
+                self.bulk = None;
                 self.apply_geometry();
                 None
             }
             _ => {
                 let t = text.filter(|t| t.chars().all(|c| !c.is_control()))?;
                 self.query.push_str(t);
+                self.selected.clear();
+                self.bulk = None;
                 self.scroll.to(0.0);
                 self.apply_geometry();
                 None
             }
         }
+    }
+
+    pub fn show_error(&mut self, message: &str) {
+        self.status = Some(message.into());
+        self.refresh();
+    }
+
+    pub fn finish_preview(&mut self, accept: bool) {
+        self.hover = Some(Hit::Calendar);
+        self.peek_at = None;
+        self.peeking = false;
+        if let Some(old) = self.preview.take() {
+            if !accept {
+                self.date = old;
+            }
+        }
+        self.calendar = false;
+        self.selected.clear();
+        self.bulk = None;
+        self.refresh();
     }
 
     fn toggle_menu(&mut self) {
@@ -1427,6 +1782,7 @@ impl Dock {
                 self.rest = !self.want_open;
                 self.left_at = None;
             }
+            WindowEvent::ModifiersChanged(m) => self.shift = m.state().shift_key(),
             WindowEvent::ThemeChanged(theme) => {
                 self.dark = crate::theme::is_dark(Some(*theme));
                 self.needs_paint = true;
@@ -1527,7 +1883,7 @@ impl Dock {
                 wake(at);
             }
         }
-        if let Some(at) = self.close_at {
+        if let Some(at) = self.close_at.filter(|_| self.preview.is_none() && self.bulk.is_none()) {
             if now >= at {
                 self.close_at = None;
                 self.start(false);
@@ -1637,6 +1993,27 @@ impl Dock {
                     let a = card.alpha;
                     let hovered = row.hit.is_some() && row.hit == hover;
                     match &row.kind {
+                        RowKind::Controls(cells) => {
+                            cards.push((card.rect, a, (ch / 2.0).min(12.0 * s), false));
+                            let cell_w = cw / cells.len() as f32;
+                            for (i, (label, hit)) in cells.iter().enumerate() {
+                                let active = hover == Some(*hit) || matches!(hit, Hit::Date(d) if *d == self.date);
+                                let rect =
+                                    (x + i as f32 * cell_w + 2.0 * s, y + 2.0 * s, cell_w - 4.0 * s, ch - 4.0 * s);
+                                if active {
+                                    shapes.push((Shape::Hover, rect, a));
+                                }
+                                let t = ellipsized(
+                                    fonts,
+                                    label,
+                                    11.0 * s,
+                                    if active { Weight::SEMIBOLD } else { Weight::NORMAL },
+                                    cell_w - 8.0 * s,
+                                );
+                                let at = (rect.0 + (rect.2 - label_width(&t)) / 2.0, y + (ch - line_h(&t)) / 2.0);
+                                labels.push((t, pal.text.text((255.0 * a) as u8), at, body_clip));
+                            }
+                        }
                         RowKind::Section { title, count, collapsed } => {
                             let caps = title.to_uppercase();
                             match st.list_headers {
@@ -1727,7 +2104,17 @@ impl Dock {
                             let ty = y + (ch - tile) / 2.0;
                             let (accent, wash) = theme::tint(item.tint, dark);
                             tiles.push(((tx, ty, tile, tile), wash, if item.hidden { a * 0.5 } else { a }));
-                            let glyph = if item.icon.is_empty() {
+                            let glyph = if self.selecting {
+                                (
+                                    small_label(
+                                        fonts,
+                                        if self.selected.contains(&item.note) { "☑" } else { "☐" },
+                                        base * 0.55,
+                                        Weight::SEMIBOLD,
+                                    ),
+                                    accent,
+                                )
+                            } else if item.icon.is_empty() {
                                 let initial: String = item.title.chars().next().unwrap_or('•').to_uppercase().collect();
                                 (small_label(fonts, &initial, (base * 0.46).round(), Weight::SEMIBOLD), accent)
                             } else {
@@ -2334,6 +2721,35 @@ impl Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_scope_keeps_today_other_profiles_and_trash() {
+        let today = NaiveDate::from_ymd_opt(2026, 11, 13).unwrap();
+        let item = |note, list, day, trashed| DockItem {
+            id: WindowId::dummy(),
+            note,
+            list,
+            day,
+            trashed,
+            title: String::new(),
+            sub: String::new(),
+            tint: 0,
+            icon: String::new(),
+            reminder: false,
+            here: true,
+            hidden: false,
+        };
+        let items = vec![
+            item(1, 1, Some(today), false),
+            item(2, 1, today.pred_opt(), false),
+            item(3, 2, today.pred_opt(), false),
+            item(4, 1, today.pred_opt(), true),
+            item(5, 1, None, false),
+        ];
+        assert_eq!(bulk_targets(&items, &[1], &HashSet::new(), Some(today)), vec![2]);
+        assert_eq!(bulk_targets(&items, &[1], &HashSet::from([1, 2, 3, 4]), None), vec![1, 2]);
+        assert!(bulk_targets(&items, &[1], &HashSet::new(), None).is_empty());
+    }
 
     #[test]
     fn falloff_is_one_at_the_pointer_and_zero_beyond_reach() {

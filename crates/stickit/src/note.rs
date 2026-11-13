@@ -2017,6 +2017,15 @@ impl Note {
         if let Some(consumed) = self.popover_key(ev, shared) {
             return consumed;
         }
+        let primary = if cfg!(target_os = "macos") {
+            self.mods.super_key()
+        } else {
+            self.mods.control_key() && !self.mods.alt_key()
+        };
+        if primary && !self.mods.shift_key() && ev.logical_key == Key::Named(NamedKey::Enter) && self.doc.subtask() {
+            self.changed(shared, true);
+            return None;
+        }
         if let Some(action) = shared.config.note_action(ev, self.mods) {
             return self.run_action(action, shared);
         }
@@ -3894,6 +3903,54 @@ impl Note {
         self.user_hidden = false;
         self.hiding = false;
         self.dirty = true;
+    }
+
+    /// Transient date previews never alter persisted hidden flags or mark data dirty.
+    pub fn preview_shown(&mut self, shown: bool) {
+        self.hiding = false;
+        self.set_shown(shown);
+        if shown {
+            self.window.set_minimized(false);
+            self.opacity.snap_to(1.0);
+            self.appear.snap_to(1.0);
+        }
+        self.needs_paint = true;
+    }
+
+    /// Preview is scroll-only until the app accepts it on edit intent.
+    pub fn preview_event(&mut self, event: &WindowEvent) {
+        match event {
+            WindowEvent::CursorMoved { position, .. } => self.pointer = (position.x, position.y),
+            WindowEvent::CursorEntered { .. } => self.hovered = true,
+            WindowEvent::CursorLeft { .. } => self.hovered = false,
+            WindowEvent::Focused(focused) => self.focused = *focused,
+            _ => {}
+        }
+        if let WindowEvent::ModifiersChanged(m) = event {
+            self.mods = m.state();
+        }
+        if let WindowEvent::KeyboardInput { event, .. } = event {
+            if event.state == ElementState::Pressed {
+                let amount = match event.logical_key {
+                    Key::Named(NamedKey::ArrowUp) => -self.st.line() * self.scale(),
+                    Key::Named(NamedKey::ArrowDown) => self.st.line() * self.scale(),
+                    Key::Named(NamedKey::PageUp) => -self.content_rect().3,
+                    Key::Named(NamedKey::PageDown) => self.content_rect().3,
+                    _ => 0.0,
+                };
+                self.scroll += amount;
+                self.clamp_scroll();
+            }
+        }
+        if let WindowEvent::MouseWheel { delta, .. } = event {
+            let dy = match delta {
+                MouseScrollDelta::LineDelta(_, y) => y * 3.0 * self.st.line() * self.scale(),
+                MouseScrollDelta::PixelDelta(p) => p.y as f32,
+            };
+            self.scroll -= dy;
+            self.clamp_scroll();
+        }
+        self.needs_paint = true;
     }
 
     pub fn set_shown(&mut self, shown: bool) {

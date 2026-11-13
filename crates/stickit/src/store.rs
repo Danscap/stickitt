@@ -47,7 +47,7 @@ pub struct Store {
     conn: Connection,
 }
 
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 /// The list every note falls back to; it can be renamed but not deleted.
 pub const DEFAULT_LIST: i64 = 1;
 /// The profile showing every list; created on first run.
@@ -58,7 +58,17 @@ impl Store {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        Self::init(Connection::open(path)?)
+        let conn = Connection::open(path)?;
+        let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if (1..6).contains(&version) {
+            // VACUUM INTO includes committed WAL contents, unlike copying the .db alone.
+            let backup = path.with_extension(format!(
+                "pre-dates-{}.db",
+                chrono::Local::now().timestamp_nanos_opt().unwrap_or_default()
+            ));
+            conn.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])?;
+        }
+        Self::init(conn)
     }
 
     pub fn in_memory() -> rusqlite::Result<Self> {
@@ -113,7 +123,19 @@ impl Store {
         if version < 5 {
             conn.execute_batch("ALTER TABLE notes ADD COLUMN view INTEGER NOT NULL DEFAULT 0;")?;
         }
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        if version < 6 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE note_dates (
+                note_id INTEGER PRIMARY KEY REFERENCES notes(id) ON DELETE CASCADE,
+                local_day TEXT NOT NULL
+            );",
+            )?;
+            let today = chrono::Local::now().date_naive().to_string();
+            tx.execute("INSERT INTO note_dates SELECT id, ?1 FROM notes", [&today])?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+        }
         Ok(Self { conn })
     }
 
@@ -165,11 +187,40 @@ impl Store {
     }
 
     pub fn insert(&self, rec: &NoteRecord) -> rusqlite::Result<i64> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO notes (body, w, h, color, mode, zoom, icon, list_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![rec.body, rec.size.0, rec.size.1, rec.color, rec.mode, rec.zoom, rec.icon, rec.list],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO note_dates VALUES (?1, ?2)",
+            params![id, chrono::Local::now().date_naive().to_string()],
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn note_dates(&self) -> rusqlite::Result<std::collections::HashMap<i64, chrono::NaiveDate>> {
+        let mut stmt = self.conn.prepare("SELECT note_id, local_day FROM note_dates")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut dates = std::collections::HashMap::new();
+        for row in rows {
+            let (id, day) = row?;
+            if let Ok(day) = day.parse() {
+                dates.insert(id, day);
+            }
+        }
+        Ok(dates)
+    }
+
+    /// Atomic soft deletion. No records are purged; callers offer the existing grouped Undo.
+    pub fn trash_many(&mut self, ids: &[i64]) -> rusqlite::Result<()> {
+        let tx = self.conn.transaction()?;
+        for id in ids {
+            tx.execute("UPDATE notes SET deleted_at=unixepoch() WHERE id=?1 AND deleted_at IS NULL", [id])?;
+        }
+        tx.commit()
     }
 
     pub fn save_all<'a>(&mut self, recs: impl IntoIterator<Item = &'a NoteRecord>) -> rusqlite::Result<()> {
@@ -361,6 +412,81 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_bulk_trash_rolls_back_every_note() {
+        let mut store = Store::in_memory().unwrap();
+        let a = store.insert(&note()).unwrap();
+        let b = store.insert(&note()).unwrap();
+        store
+            .conn
+            .execute_batch(&format!(
+                "CREATE TRIGGER refuse_second BEFORE UPDATE OF deleted_at ON notes
+            WHEN NEW.id={b} BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;"
+            ))
+            .unwrap();
+        assert!(store.trash_many(&[a, b]).is_err());
+        assert_eq!(store.load().unwrap().len(), 2);
+        assert!(store.trashed(10).unwrap().is_empty());
+        store.conn.execute_batch("DROP TRIGGER refuse_second").unwrap();
+        store.trash_many(&[a, b]).unwrap();
+        assert!(store.load().unwrap().is_empty());
+        for id in [a, b] {
+            assert_eq!(store.restore(id).unwrap().unwrap().body, "hi");
+        }
+        assert_eq!(store.load().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn effective_dates_migrate_once_and_preserve_raw_metadata() {
+        let store = Store::in_memory().unwrap();
+        let id = store.insert(&note()).unwrap();
+        store.conn.execute("UPDATE notes SET created_at=123, updated_at=456 WHERE id=?1", [id]).unwrap();
+        store.conn.execute_batch("DROP TABLE note_dates; PRAGMA user_version=5;").unwrap();
+        let store = Store::init(store.conn).unwrap();
+        assert_eq!(store.note_dates().unwrap()[&id], chrono::Local::now().date_naive());
+        store.conn.execute("UPDATE note_dates SET local_day='2020-01-02'", []).unwrap();
+        let mut store = Store::init(store.conn).unwrap();
+        assert_eq!(store.note_dates().unwrap()[&id].to_string(), "2020-01-02");
+        let raw: (i64, i64) = store
+            .conn
+            .query_row("SELECT created_at, updated_at FROM notes", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(raw, (123, 456));
+        store.trash_many(&[id]).unwrap();
+        store.restore(id).unwrap();
+        assert_eq!(store.note_dates().unwrap()[&id].to_string(), "2020-01-02");
+    }
+
+    #[test]
+    fn upgrade_makes_reopenable_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "stickit-upgrade-{}-{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fixture.db");
+        {
+            let store = Store::open(&path).unwrap();
+            store.insert(&note()).unwrap();
+            store.conn.execute_batch("DROP TABLE note_dates; PRAGMA user_version=5;").unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.load().unwrap().len(), 1);
+        drop(store);
+        let backup = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| e.file_name().to_string_lossy().contains("pre-dates-"))
+            .unwrap()
+            .path();
+        let conn = Connection::open(&backup).unwrap();
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0)).unwrap(), 5);
+        assert_eq!(conn.query_row("SELECT body FROM notes", [], |r| r.get::<_, String>(0)).unwrap(), "hi");
+        drop(conn);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn trash_and_restore() {
