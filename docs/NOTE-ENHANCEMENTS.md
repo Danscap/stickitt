@@ -1,12 +1,9 @@
-# Jorge's Stickitt changes — draft code review
-
-Target fork: https://github.com/Danscap/stickitt
+# Note enhancements — draft code review
 
 Pinned base: `00a26002fc7505ecf73f2d75ddbba375b1d5ce0a`.
-The fork's `main` was checked against this base before editing. Changes are on the
-fork-only branch `jorge/review-note-enhancements-20261113` in draft PR
-https://github.com/Danscap/stickitt/pull/1. No installer dispatch, merge, tag, release,
-or access to a live note database has occurred.
+The changes are proposed in a draft pull request for review before any installer
+build. No installer dispatch, merge, tag, release, or access to a live note database
+has occurred.
 
 ## Implemented
 
@@ -77,11 +74,11 @@ Manual Windows verification below uses fresh fixtures only.
 Run in PowerShell from the folder containing this bundle:
 
 ```powershell
-git clone https://github.com/Danscap/stickitt.git stickitt-jorge-test
-Set-Location stickitt-jorge-test
+git clone https://github.com/shiv122/stickitt.git stickitt-preview-test
+Set-Location stickitt-preview-test
 git switch --detach 00a26002fc7505ecf73f2d75ddbba375b1d5ce0a
-git apply --check ..\stickitt-jorge.patch
-git apply ..\stickitt-jorge.patch
+git apply --check ..\stickitt-note-enhancements.patch
+git apply ..\stickitt-note-enhancements.patch
 cargo fmt --all --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
@@ -99,11 +96,11 @@ script can use a different compatible Inno installation through `ISCC`:
 ```powershell
 # Optional if ISCC is not found automatically:
 # $env:ISCC = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
-.\scripts\package-windows.ps1 -Version '0.1.0-jorge-test.1'
-Get-FileHash .\dist\Stick-itt-0.1.0-jorge-test.1-windows-setup.exe -Algorithm SHA256
+.\scripts\package-windows.ps1 -Version '0.1.0-preview.1'
+Get-FileHash .\dist\Stick-itt-0.1.0-preview.1-windows-setup.exe -Algorithm SHA256
 ```
 
-The desired output is **`dist\Stick-itt-0.1.0-jorge-test.1-windows-setup.exe`**.
+The desired output is **`dist\Stick-itt-0.1.0-preview.1-windows-setup.exe`**.
 It would be an unsigned test installer. The packaging script also stages a portable
 executable, but no portable executable is supplied as this request's deliverable.
 Do not call the installer verified until its install, launch, upgrade and uninstall
@@ -114,9 +111,9 @@ behavior has been checked on a disposable Windows VM/account.
 release and its SHA-256 matched the published digest. Debian Wine 10 aborted with
 `free(): invalid pointer` before the compiler setup could run, both with workspace
 and host runtime libraries. No installer compiler execution/build succeeded.
-A supported Windows builder is still needed. The fork's existing GitHub workflow
-is available for a later authorized installer step. Source is now in draft PR
-https://github.com/Danscap/stickitt/pull/1 for review. No installer workflow has been
+A supported Windows builder is still needed. The repository's existing GitHub workflow
+is available for a later authorized installer step. Source is in a draft pull request
+for review. No installer workflow has been
 dispatched; merge, tags, releases and installer work remain paused.
 
 ## Validation evidence
